@@ -1,0 +1,4 @@
+node_modules/
+agvid-output/
+.tasks/
+*.tgz
