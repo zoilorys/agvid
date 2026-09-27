@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -72,19 +72,33 @@ function run(program, args) {
 }
 
 async function probe(video) {
-  const raw = await run('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,avg_frame_rate,codec_name:format=duration', '-of', 'json', video]);
+  const raw = await run('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,avg_frame_rate,codec_name,duration:stream_tags=DURATION', '-of', 'json', video]);
   const data = JSON.parse(raw);
   const stream = data.streams?.[0];
   if (!stream) throw new Error('no video stream found');
-  const duration = Number(data.format?.duration);
-  if (!Number.isFinite(duration) || duration <= 0) throw new Error('video duration is unavailable');
+  let duration = Number(stream.duration);
+  if ((!Number.isFinite(duration) || duration <= 0) && stream.tags?.DURATION) {
+    try { duration = parseTime(stream.tags.DURATION); }
+    catch { duration = NaN; }
+  }
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new Error('first video stream has no duration metadata; provide a video with a known video-stream duration');
+  }
+  if (!Number.isInteger(stream.width) || stream.width <= 0 || !Number.isInteger(stream.height) || stream.height <= 0) {
+    throw new Error('video dimensions are unavailable');
+  }
   return { video, duration, width: stream.width, height: stream.height, fps: stream.avg_frame_rate, codec: stream.codec_name };
 }
 
 async function outputDirectory(video, command, requested) {
   if (requested) {
     const directory = path.resolve(requested);
-    await mkdir(directory, { recursive: true });
+    try {
+      if ((await readdir(directory)).length) throw new Error(`output directory is not empty: ${directory}`);
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      await mkdir(directory, { recursive: true });
+    }
     return directory;
   }
   const root = path.resolve('agvid-output');
@@ -102,12 +116,19 @@ async function outputDirectory(video, command, requested) {
 }
 
 async function extract(video, time, width, filename) {
-  await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-ss', String(time), '-i', video, '-frames:v', '1', '-vf', `scale=${width}:-2`, '-q:v', '4', '-y', filename]);
+  await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-ss', String(time), '-i', video, '-map', '0:v:0', '-frames:v', '1', '-vf', `scale=${width}:max(2\\,round(${width}/dar/2)*2),setsar=1`, '-threads:v', '1', '-q:v', '4', '-y', filename]);
+}
+
+async function nonempty(filename) {
+  try { return (await stat(filename)).size > 0; }
+  catch (error) { if (error.code === 'ENOENT') return false; throw error; }
 }
 
 async function saveManifest(directory, result) {
   const filename = path.join(directory, 'manifest.json');
-  await writeFile(filename, `${JSON.stringify(result, null, 2)}\n`);
+  const temporary = path.join(directory, 'manifest.json.tmp');
+  await writeFile(temporary, `${JSON.stringify(result, null, 2)}\n`);
+  await rename(temporary, filename);
   return filename;
 }
 
@@ -141,6 +162,7 @@ export async function main(args) {
     const start = Math.max(0, around - window / 2);
     const end = Math.min(info.duration, around + window / 2);
     const count = Math.ceil((end - start) * fps);
+    if (count < 1) throw new Error('inspect window contains no frames');
     if (count > 240) throw new Error('inspect would create over 240 frames; reduce --window or --fps');
     times = Array.from({ length: count }, (_, i) => Math.min(end - 0.001, start + (i + 0.5) / fps));
   } else {
@@ -151,18 +173,36 @@ export async function main(args) {
   }
   const directory = await outputDirectory(video, command, options.output);
   const frames = [];
-  for (let i = 0; i < times.length; i++) {
-    const filename = `frame-${String(i).padStart(4, '0')}.jpg`;
-    await extract(video, times[i], width, path.join(directory, filename));
-    frames.push({ file: filename, time: Number(times[i].toFixed(3)) });
+  const produced = [];
+  try {
+    for (let i = 0; i < times.length; i++) {
+      const filename = `frame-${String(i).padStart(4, '0')}.jpg`;
+      const target = path.join(directory, filename);
+      produced.push(target);
+      let extractionError;
+      try { await extract(video, times[i], width, target); }
+      catch (error) { extractionError = error; }
+      if (extractionError && await nonempty(target)) throw extractionError;
+      if (!(await nonempty(target)) && info.duration - times[i] < 0.1) {
+        await extract(video, Math.max(0, info.duration - 0.1), width, target);
+      }
+      if (!(await nonempty(target))) throw extractionError ?? new Error(`FFmpeg produced no frame for ${times[i]}s`);
+      frames.push({ file: filename, time: times[i] });
+    }
+    let sheet;
+    if (command === 'overview') {
+      const columns = Math.min(4, Math.ceil(Math.sqrt(frames.length)));
+      const rows = Math.ceil(frames.length / columns);
+      sheet = path.join(directory, 'contact-sheet.jpg');
+      produced.push(sheet);
+      await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-framerate', '1', '-start_number', '0', '-i', path.join(directory, 'frame-%04d.jpg'), '-vf', `tile=${columns}x${rows}`, '-frames:v', '1', '-threads:v', '1', '-q:v', '4', '-y', sheet]);
+      if (!(await nonempty(sheet))) throw new Error('FFmpeg produced no contact sheet');
+    }
+    produced.push(path.join(directory, 'manifest.json.tmp'), path.join(directory, 'manifest.json'));
+    const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, frames, ...(sheet ? { contactSheet: path.basename(sheet) } : {}) });
+    console.log(JSON.stringify({ directory, manifest, ...(sheet ? { contactSheet: sheet } : {}), frames: frames.length }, null, 2));
+  } catch (error) {
+    await Promise.all(produced.map((file) => rm(file, { force: true }).catch(() => {})));
+    throw error;
   }
-  let sheet;
-  if (command === 'overview') {
-    const columns = Math.min(4, Math.ceil(Math.sqrt(frames.length)));
-    const rows = Math.ceil(frames.length / columns);
-    sheet = path.join(directory, 'contact-sheet.jpg');
-    await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-framerate', '1', '-start_number', '0', '-i', path.join(directory, 'frame-%04d.jpg'), '-vf', `tile=${columns}x${rows}`, '-frames:v', '1', '-q:v', '4', '-y', sheet]);
-  }
-  const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, frames, ...(sheet ? { contactSheet: path.basename(sheet) } : {}) });
-  console.log(JSON.stringify({ directory, manifest, ...(sheet ? { contactSheet: sheet } : {}), frames: frames.length }, null, 2));
 }

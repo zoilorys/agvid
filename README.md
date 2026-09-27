@@ -16,16 +16,16 @@ For a checkout, run `npm link` from the repository root. The package also includ
 
 ```sh
 agvid probe video.mov
-agvid overview --frames 12 video.mov
+agvid overview video.mov
 agvid inspect video.mov --around 00:07.5 --window 2s --fps 4
 agvid frame video.mov --at 00:07.5 --width 320
 ```
 
 `overview` samples evenly across the video and writes `contact-sheet.jpg`, individual JPEG frames, and `manifest.json`. `inspect` samples the centered window at the requested frame rate. `frame` extracts one JPEG. `probe` prints source metadata as JSON.
 
-Frame width defaults to 640 pixels. Use `--width PX` on image commands to reduce size. Use `--output DIR` to choose a directory. By default, each run gets a fresh directory under `./agvid-output/`. The command prints the output paths as JSON. The manifest maps each frame filename to a source timestamp in seconds.
+`overview` defaults to 12 frames. Frame width defaults to a 640 pixel cap; `--width PX` accepts 64 to 4096 and preserves aspect ratio without enlarging narrower sources. Use `--output DIR` for a specific new or empty directory so results from separate runs do not mix. Otherwise, each run gets a fresh directory under `./agvid-output/`. The command prints output paths as JSON. The manifest maps each frame filename to its requested source time in seconds.
 
-`--window` is the total duration, so `--around 00:07.5 --window 2s` covers roughly 6.5 to 8.5 seconds. The window clips at the start or end of the video. `inspect` caps output at 240 frames; `overview` accepts 1 to 64 frames.
+`--window` defaults to 2 seconds and is the total duration, so `--around 00:07.5 --window 2s` covers roughly 6.5 to 8.5 seconds. The window clips at the start or end of the video. `--fps` defaults to 4. `inspect` caps output at 240 frames; `overview` accepts 1 to 64 frames.
 
 FFmpeg seeking can land on a nearby decoded frame, depending on the source codec. Use the timestamps as requested positions, not frame accuracy guarantees.
 
