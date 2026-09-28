@@ -128,6 +128,35 @@ async function nonempty(filename) {
   catch (error) { if (error.code === 'ENOENT') return false; throw error; }
 }
 
+const SHEET_BUDGET = 1568;
+
+export function sheetLayout(count, tileAspect, frameWidth, frameHeight) {
+  const even = (value) => Math.max(2, Math.floor(value / 2) * 2);
+  let best;
+  for (let columns = 1; columns <= count; columns++) {
+    const rows = Math.ceil(count / columns);
+    const tileWidth = even(Math.min(frameWidth, SHEET_BUDGET / columns, SHEET_BUDGET * tileAspect / rows));
+    let tileHeight = Math.min(frameHeight, even(Math.round(tileWidth / tileAspect)));
+    while (tileHeight > 2 && rows * tileHeight > SHEET_BUDGET) tileHeight -= 2;
+    const score = Math.abs(columns * tileWidth / (rows * tileHeight) - 1);
+    if (!best || score < best.score) best = { columns, rows, tileWidth, tileHeight, score };
+  }
+  const { score, ...layout } = best;
+  return layout;
+}
+
+async function writeSheet(directory, files, name) {
+  const sheet = path.join(directory, name);
+  const first = JSON.parse(await run('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'json', path.join(directory, files[0])])).streams[0];
+  const { columns, rows, tileWidth, tileHeight } = sheetLayout(files.length, first.width / first.height, first.width, first.height);
+  const inputs = files.flatMap((file) => ['-i', path.join(directory, file)]);
+  const scaled = files.map((_, i) => `[${i}:v]scale=${tileWidth}:${tileHeight},setsar=1[v${i}];`).join('');
+  const graph = `${scaled}${files.map((_, i) => `[v${i}]`).join('')}concat=n=${files.length}:v=1:a=0,tile=${columns}x${rows}`;
+  await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', ...inputs, '-filter_complex', graph, '-frames:v', '1', '-threads:v', '1', '-q:v', '4', '-y', sheet]);
+  if (!(await nonempty(sheet))) throw new Error('FFmpeg produced no contact sheet');
+  return sheet;
+}
+
 async function saveManifest(directory, result) {
   const filename = path.join(directory, 'manifest.json');
   const temporary = path.join(directory, 'manifest.json.tmp');
@@ -195,12 +224,8 @@ export async function main(args) {
     }
     let sheet;
     if (command === 'overview') {
-      const columns = Math.min(4, Math.ceil(Math.sqrt(frames.length)));
-      const rows = Math.ceil(frames.length / columns);
-      sheet = path.join(directory, 'contact-sheet.jpg');
-      produced.push(sheet);
-      await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-framerate', '1', '-start_number', '0', '-i', path.join(directory, 'frame-%04d.jpg'), '-vf', `tile=${columns}x${rows}`, '-frames:v', '1', '-threads:v', '1', '-q:v', '4', '-y', sheet]);
-      if (!(await nonempty(sheet))) throw new Error('FFmpeg produced no contact sheet');
+      produced.push(path.join(directory, 'contact-sheet.jpg'));
+      sheet = await writeSheet(directory, frames.map((frame) => frame.file), 'contact-sheet.jpg');
     }
     produced.push(path.join(directory, 'manifest.json.tmp'), path.join(directory, 'manifest.json'));
     const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, frames, ...(sheet ? { contactSheet: path.basename(sheet) } : {}) });

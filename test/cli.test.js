@@ -153,12 +153,33 @@ test('overview writes a contact sheet and JPEGs mapped to source times', async (
     assert.equal(manifest.frames.length, 5);
     assert.equal(manifest.contactSheet, 'contact-sheet.jpg');
     assert.ok(manifest.frames.every((frame) => frame.time > 0 && frame.time < manifest.source.duration));
-    assert.equal(jpegInfo(output.contactSheet).width, 480);
+    // 160x100 tiles: 2x3 (320x300) is closer to square than 3x2 (480x200).
+    assert.equal(jpegInfo(output.contactSheet).width, 320);
     for (const frame of manifest.frames) jpegInfo(path.join(output.directory, frame.file));
     assert.deepEqual((await readdir(directory)).sort(), [
       'contact-sheet.jpg', 'frame-0000.jpg', 'frame-0001.jpg', 'frame-0002.jpg',
       'frame-0003.jpg', 'frame-0004.jpg', 'manifest.json',
     ]);
+  });
+});
+
+test('large overview sheet stays within the pixel budget', async () => {
+  await withTempDirectory(async (directory) => {
+    const output = success('overview', video, '--frames', '64', '--output', directory);
+    const sheet = jpegInfo(output.contactSheet);
+    assert.ok(sheet.width <= 1568 && sheet.height <= 1568, `${sheet.width}x${sheet.height}`);
+  });
+});
+
+test('portrait source sheet is within budget and laid out wide', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'portrait.mp4');
+    ffmpeg('-f', 'lavfi', '-i', 'testsrc2=size=360x640:rate=10:duration=2', '-c:v', 'mpeg4', '-y', source);
+    const output = success('overview', source, '--output', path.join(directory, 'out'));
+    const sheet = jpegInfo(output.contactSheet);
+    // 12 tiles at 360x640 exceed the height budget; a 4-column grid would be 1440x1920.
+    assert.ok(sheet.width <= 1568 && sheet.height <= 1568, `${sheet.width}x${sheet.height}`);
+    assert.ok(sheet.width >= sheet.height * 0.8, `${sheet.width}x${sheet.height}`);
   });
 });
 
