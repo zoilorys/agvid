@@ -76,12 +76,19 @@ async function probe(video) {
   const data = JSON.parse(raw);
   const stream = data.streams?.[0];
   if (!stream) throw new Error('no video stream found');
+  const valid = (value) => Number.isFinite(value) && value > 0;
   let duration = Number(stream.duration);
-  if ((!Number.isFinite(duration) || duration <= 0) && stream.tags?.DURATION) {
+  let durationSource = 'stream';
+  if (!valid(duration) && stream.tags?.DURATION) {
+    durationSource = 'tag';
     try { duration = parseTime(stream.tags.DURATION); }
     catch { duration = NaN; }
   }
-  if (!Number.isFinite(duration) || duration <= 0) {
+  if (!valid(duration)) {
+    durationSource = 'packets';
+    duration = await packetDuration(video);
+  }
+  if (!valid(duration)) {
     throw new Error('first video stream has no duration metadata; provide a video with a known video-stream duration');
   }
   if (!Number.isInteger(stream.width) || stream.width <= 0 || !Number.isInteger(stream.height) || stream.height <= 0) {
@@ -91,7 +98,20 @@ async function probe(video) {
   const rotation = Number.isFinite(rawRotation) ? ((Math.round(rawRotation) % 360) + 360) % 360 : 0;
   const swap = rotation === 90 || rotation === 270;
   return { video, duration, width: swap ? stream.height : stream.width, height: swap ? stream.width : stream.height,
-    rotation, codedWidth: stream.width, codedHeight: stream.height, fps: stream.avg_frame_rate, codec: stream.codec_name };
+    rotation, codedWidth: stream.width, codedHeight: stream.height, fps: stream.avg_frame_rate, codec: stream.codec_name, durationSource };
+}
+
+async function packetDuration(video) {
+  const raw = await run('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'packet=pts_time,duration_time', '-of', 'csv=p=0', video]);
+  let start = Infinity;
+  let end = -Infinity;
+  for (const line of raw.split('\n')) {
+    const [pts, length] = line.split(',').map((field) => (/^-?\d+(?:\.\d+)?$/.test(field?.trim() ?? '') ? Number(field) : NaN));
+    if (!Number.isFinite(pts) || !Number.isFinite(length)) continue;
+    start = Math.min(start, pts);
+    end = Math.max(end, pts + length);
+  }
+  return end - start;
 }
 
 async function outputDirectory(video, command, requested) {

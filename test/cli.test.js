@@ -86,6 +86,24 @@ test('probe reports displayed dimensions for a rotated video and frames are capp
   });
 });
 
+test('a streamed WebM without duration metadata uses packet timestamps', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'no-duration.webm');
+    const result = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=160x90:rate=10:duration=2',
+      '-c:v', 'libvpx', '-f', 'webm', '-'], { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 });
+    assert.equal(result.status, 0, result.stderr.toString());
+    await writeFile(source, result.stdout);
+    const info = success('probe', source);
+    assert.equal(info.durationSource, 'packets');
+    assert.ok(info.duration >= 1.95 && info.duration <= 2.05, String(info.duration));
+    const output = success('overview', source, '--frames', '3', '--output', path.join(directory, 'out'));
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    assert.equal(manifest.frames.length, 3);
+    assert.ok(manifest.frames.every((frame) => frame.time < 2));
+    for (const frame of manifest.frames) jpegInfo(path.join(output.directory, frame.file));
+  });
+});
+
 test('a video without stream duration fails with an actionable error', async () => {
   await withTempDirectory(async (directory) => {
     const source = path.join(directory, 'raw-video.m2v');
