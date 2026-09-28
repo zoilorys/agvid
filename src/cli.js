@@ -13,8 +13,10 @@ Commands:
   probe <video>
 
 TIME accepts seconds or HH:MM:SS.s. DURATION accepts seconds, with optional s suffix.
---window is the total duration centered on --around. Frames are JPEG files.
-FFmpeg and FFprobe must be available on PATH.`;
+--window is the total duration centered on --around. Options also accept --key=value.
+Writes JPEG frames and manifest.json; overview and inspect also write timecode-labeled
+sheet-NN.jpg. Output defaults to .agvid/runs/ under the git root (else cwd); --output DIR
+must be new or empty. FFmpeg and FFprobe must be available on PATH.`;
 
 const OPTIONS = {
   overview: new Set(['frames', 'width', 'output']),

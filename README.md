@@ -44,9 +44,9 @@ agvid inspect video.mov --around 00:07.5 --window 2s --fps 4
 agvid frame video.mov --at 00:07.5 --width 320
 ```
 
-`overview` samples evenly across the video and writes `contact-sheet.jpg`, individual JPEG frames, and `manifest.json`. `inspect` samples the centered window at the requested frame rate. `frame` extracts one JPEG. `probe` prints source metadata as JSON.
+`overview` samples evenly across the video. `inspect` samples the centered window at the requested frame rate. Both write JPEG frames, `manifest.json`, and sheets `sheet-01.jpg`, … (at most 1568 px per side, split across several sheets when needed), with each tile labeled bottom-left with its timecode. `frame` extracts one JPEG and no sheet. Frame files are named like `frame-0003_00-07.500.jpg`. `probe` prints source metadata as JSON: duration (with `durationSource`), displayed and coded size, rotation, fps, frame count, codec, pixel format, bit depth, and audio presence.
 
-`overview` defaults to 12 frames. Frame width defaults to a 640 pixel cap; `--width PX` accepts 64 to 4096 and preserves aspect ratio without enlarging narrower sources. Use `--output DIR` for a specific new or empty directory so results from separate runs do not mix. Otherwise, each run gets a fresh directory under `./agvid-output/`. The command prints output paths as JSON. The manifest maps each frame filename to its requested source time in seconds.
+`overview` defaults to 12 frames. Frame width defaults to a 640 pixel cap; `--width PX` accepts 64 to 4096 and preserves aspect ratio without enlarging narrower (or rotated) sources. Options accept `--key value` or `--key=value`. By default each run gets a fresh directory `.agvid/runs/<video>-<command>/` under the git root, else the current directory; `.agvid/` ignores itself in git. `--output DIR` must be new or empty. Failed runs clean up. The command prints JSON with `directory`, `sheets`, `manifest`, and the frame count. The manifest maps each frame file to its requested source `time` in seconds and `timecode`, and each sheet to its frame range and grid.
 
 `--window` defaults to 2 seconds and is the total duration, so `--around 00:07.5 --window 2s` covers roughly 6.5 to 8.5 seconds. The window clips at the start or end of the video. `--fps` defaults to 4. `inspect` caps output at 240 frames; `overview` accepts 1 to 64 frames.
 
