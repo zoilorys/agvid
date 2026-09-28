@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -10,6 +10,10 @@ const cli = path.resolve('bin/agvid.js');
 
 function invoke(...args) {
   return spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8' });
+}
+
+function invokeIn(options, ...args) {
+  return spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8', ...options });
 }
 
 function success(...args) {
@@ -254,6 +258,67 @@ test('an occupied explicit output directory is rejected without changing its con
     assert.notEqual(result.status, 0);
     assert.equal(await readFile(sentinel, 'utf8'), 'keep this');
     assert.deepEqual(await readdir(directory), ['keep.txt']);
+  });
+});
+
+test('default output goes under the git root .agvid folder and stays out of git status', async () => {
+  await withTempDirectory(async (directory) => {
+    const repo = await realpath(directory);
+    assert.equal(spawnSync('git', ['init', '-q', repo]).status, 0);
+    const sub = path.join(repo, 'sub', 'dir');
+    await mkdir(sub, { recursive: true });
+    const result = invokeIn({ cwd: sub }, 'frame', video, '--at', '1');
+    assert.equal(result.status, 0, result.stderr);
+    const output = JSON.parse(result.stdout);
+    assert.equal(path.dirname(output.directory), path.join(repo, '.agvid', 'runs'));
+    jpegInfo(path.join(output.directory, 'frame-0000.jpg'));
+    assert.equal(await readFile(path.join(repo, '.agvid', '.gitignore'), 'utf8'), '*\n');
+    await writeFile(path.join(sub, 'tracked.txt'), 'x');
+    const status = spawnSync('git', ['status', '--porcelain', '--untracked-files=all'], { cwd: repo, encoding: 'utf8' });
+    assert.equal(status.status, 0, status.stderr);
+    assert.equal(status.stdout, '?? sub/dir/tracked.txt\n');
+  });
+});
+
+test('outside a git repo default output goes under the cwd .agvid folder', async () => {
+  await withTempDirectory(async (directory) => {
+    const cwd = await realpath(directory);
+    const output = JSON.parse(invokeIn({ cwd }, 'frame', video, '--at', '1').stdout);
+    assert.equal(path.dirname(output.directory), path.join(cwd, '.agvid', 'runs'));
+  });
+});
+
+test('a failed extraction removes directories agvid created and nothing else', async () => {
+  await withTempDirectory(async (directory) => {
+    const bin = path.join(directory, 'bin');
+    await mkdir(bin);
+    await writeFile(path.join(bin, 'ffmpeg'), '#!/bin/sh\nexit 1\n');
+    await chmod(path.join(bin, 'ffmpeg'), 0o755);
+    const options = { cwd: directory, env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` } };
+    const failed = invokeIn(options, 'frame', video, '--at', '1');
+    assert.notEqual(failed.status, 0);
+    assert.deepEqual(await readdir(path.join(directory, '.agvid', 'runs')), []);
+    const empty = path.join(directory, 'empty');
+    await mkdir(empty);
+    for (const output of ['out', 'nested/a/out', 'empty']) {
+      const explicit = invokeIn(options, 'frame', video, '--at', '1', '--output', path.join(directory, output));
+      assert.notEqual(explicit.status, 0);
+      assert.match(explicit.stderr, /ffmpeg exited/);
+    }
+    assert.deepEqual((await readdir(directory)).sort(), ['.agvid', 'bin', 'empty']);
+    assert.deepEqual(await readdir(empty), []);
+  });
+});
+
+test('an unwritable project root fails with a clear error', { skip: process.getuid?.() === 0 }, async () => {
+  await withTempDirectory(async (directory) => {
+    await chmod(directory, 0o555);
+    try {
+      const result = invokeIn({ cwd: directory }, 'frame', video, '--at', '1');
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /cannot write output under/);
+      assert.match(result.stderr, /--output/);
+    } finally { await chmod(directory, 0o755); }
   });
 });
 

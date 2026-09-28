@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rename, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -127,25 +127,52 @@ async function packetDuration(video) {
   return end - start;
 }
 
+async function findProjectRoot(cwd) {
+  for (let dir = cwd; ; dir = path.dirname(dir)) {
+    try { await stat(path.join(dir, '.git')); return dir; }
+    catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error; }
+    if (path.dirname(dir) === dir) return cwd;
+  }
+}
+
+// Removes the empty parents of `directory` that mkdir created, up to and including `first`.
+async function removeParents(directory, first) {
+  if (!first) return;
+  for (let dir = path.dirname(directory); ; dir = path.dirname(dir)) {
+    try { await rmdir(dir); }
+    catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ENOTEMPTY') throw error; }
+    if (dir === first || path.dirname(dir) === dir) return;
+  }
+}
+
 async function outputDirectory(video, command, requested) {
   if (requested) {
     const directory = path.resolve(requested);
+    const firstParent = await mkdir(path.dirname(directory), { recursive: true });
     try {
-      if ((await readdir(directory)).length) throw new Error(`output directory is not empty: ${directory}`);
+      await mkdir(directory);
+      return { directory, created: true, firstParent };
     } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-      await mkdir(directory, { recursive: true });
+      if (error.code !== 'EEXIST') { await removeParents(directory, firstParent); throw error; }
     }
-    return directory;
+    if ((await readdir(directory)).length) throw new Error(`output directory is not empty: ${directory}`);
+    return { directory, created: false };
   }
-  const root = path.resolve('agvid-output');
-  await mkdir(root, { recursive: true });
+  const agvid = path.join(await findProjectRoot(process.cwd()), '.agvid');
+  const root = path.join(agvid, 'runs');
+  try {
+    await mkdir(root, { recursive: true });
+    try { await writeFile(path.join(agvid, '.gitignore'), '*\n', { flag: 'wx' }); }
+    catch (error) { if (error.code !== 'EEXIST') throw error; }
+  } catch (error) {
+    throw new Error(`cannot write output under ${agvid} (${error.code ?? error.message}); pass --output DIR`);
+  }
   const base = `${path.parse(video).name.replace(/[^a-zA-Z0-9._-]/g, '_')}-${command}`;
   for (let suffix = 0; ; suffix++) {
     const directory = path.join(root, suffix ? `${base}-${suffix}` : base);
     try {
       await mkdir(directory);
-      return directory;
+      return { directory, created: true };
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
     }
@@ -256,7 +283,7 @@ export async function main(args) {
     if (at >= info.duration) throw new Error('--at must be before the video ends');
     times = [at];
   }
-  const directory = await outputDirectory(video, command, options.output);
+  const { directory, created, firstParent } = await outputDirectory(video, command, options.output);
   const frames = [];
   const produced = [];
   try {
@@ -289,7 +316,11 @@ export async function main(args) {
     const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, frames, ...(sheets ? { sheets } : {}) });
     console.log(JSON.stringify({ directory, manifest, ...(sheets ? { sheets: sheets.map((sheet) => path.join(directory, sheet.file)) } : {}), frames: frames.length }, null, 2));
   } catch (error) {
-    await Promise.all(produced.map((file) => rm(file, { force: true }).catch(() => {})));
+    if (created) {
+      await rm(directory, { recursive: true, force: true })
+        .then(() => removeParents(directory, firstParent)).catch(() => {});
+    }
+    else await Promise.all(produced.map((file) => rm(file, { force: true }).catch(() => {})));
     throw error;
   }
 }
