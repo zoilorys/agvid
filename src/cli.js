@@ -72,7 +72,7 @@ function run(program, args) {
 }
 
 async function probe(video) {
-  const raw = await run('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,avg_frame_rate,codec_name,duration:stream_tags=DURATION', '-of', 'json', video]);
+  const raw = await run('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,avg_frame_rate,codec_name,duration:stream_side_data=rotation:stream_tags=DURATION,rotate', '-of', 'json', video]);
   const data = JSON.parse(raw);
   const stream = data.streams?.[0];
   if (!stream) throw new Error('no video stream found');
@@ -87,7 +87,11 @@ async function probe(video) {
   if (!Number.isInteger(stream.width) || stream.width <= 0 || !Number.isInteger(stream.height) || stream.height <= 0) {
     throw new Error('video dimensions are unavailable');
   }
-  return { video, duration, width: stream.width, height: stream.height, fps: stream.avg_frame_rate, codec: stream.codec_name };
+  const rawRotation = Number(stream.side_data_list?.find((entry) => entry.rotation !== undefined)?.rotation ?? stream.tags?.rotate ?? 0);
+  const rotation = Number.isFinite(rawRotation) ? ((Math.round(rawRotation) % 360) + 360) % 360 : 0;
+  const swap = rotation === 90 || rotation === 270;
+  return { video, duration, width: swap ? stream.height : stream.width, height: swap ? stream.width : stream.height,
+    rotation, codedWidth: stream.width, codedHeight: stream.height, fps: stream.avg_frame_rate, codec: stream.codec_name };
 }
 
 async function outputDirectory(video, command, requested) {

@@ -72,6 +72,17 @@ test('overview samples the video duration when audio continues after it', async 
   });
 });
 
+test('probe reports displayed dimensions for a rotated video', async () => {
+  await withTempDirectory(async (directory) => {
+    const plain = path.join(directory, 'plain.mp4');
+    const rotated = path.join(directory, 'rotated.mp4');
+    ffmpeg('-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=10:duration=2', '-c:v', 'mpeg4', '-y', plain);
+    ffmpeg('-display_rotation', '90', '-i', plain, '-c', 'copy', '-y', rotated);
+    const info = success('probe', rotated);
+    assert.deepEqual([info.width, info.height, info.rotation, info.codedWidth, info.codedHeight], [180, 320, 90, 320, 180]);
+  });
+});
+
 test('a video without stream duration fails with an actionable error', async () => {
   await withTempDirectory(async (directory) => {
     const source = path.join(directory, 'raw-video.m2v');
