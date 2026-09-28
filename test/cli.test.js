@@ -4,6 +4,7 @@ import { spawnSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { formatTimecode } from '../src/cli.js';
 
 const video = path.resolve('test/fixtures/test.mov');
 const cli = path.resolve('bin/agvid.js');
@@ -53,10 +54,10 @@ test('probe reports the real fixture and frame extracts a bounded JPEG at its re
     assert.equal(info.fps, 53.199);
     assert.deepEqual([info.frameCount, info.frameCountEstimated, info.hasAudio], [1361, false, false]);
 
-    const output = success('frame', video, '--at', '00:07.5004', '--width', '160', '--output', directory);
+    const output = success('frame', video, '--at', '00:07.5', '--width', '160', '--output', directory);
     const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
-    assert.equal(manifest.frames.length, 1);
-    assert.equal(manifest.frames[0].time, 7.5004);
+    assert.deepEqual(manifest.frames, [{ file: 'frame-0000_00-07.500.jpg', time: 7.5, timecode: '00:07.500' }]);
+    assert.deepEqual((await readdir(directory)).sort(), ['frame-0000_00-07.500.jpg', 'manifest.json']);
     const frame = jpegInfo(path.join(output.directory, manifest.frames[0].file));
     assert.ok(frame.width <= 160);
     assert.ok(Math.abs(frame.width / frame.height - info.width / info.height) < 0.03);
@@ -65,10 +66,11 @@ test('probe reports the real fixture and frame extracts a bounded JPEG at its re
 
 test('frame accepts --option=value spelling and rejects duplicates across spellings', async () => {
   await withTempDirectory(async (directory) => {
-    const output = success('frame', video, '--at=7.5', '--width=160', `--output=${directory}`);
+    // A sub-millisecond request rounds to the millisecond the filename names.
+    const output = success('frame', video, '--at=7.5004', '--width=160', `--output=${directory}`);
     assert.equal(output.directory, directory);
     const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
-    assert.equal(manifest.frames[0].time, 7.5);
+    assert.deepEqual([manifest.frames[0].time, manifest.frames[0].file], [7.5, 'frame-0000_00-07.500.jpg']);
     assert.ok(jpegInfo(path.join(output.directory, manifest.frames[0].file)).width <= 160);
     const duplicate = invoke('frame', video, '--at', '1', '--at=2', '--output', path.join(directory, 'dup'));
     assert.notEqual(duplicate.status, 0);
@@ -102,9 +104,26 @@ test('probe reports displayed dimensions for a rotated video and frames are capp
     const info = success('probe', rotated);
     assert.deepEqual([info.width, info.height, info.rotation, info.codedWidth, info.codedHeight], [180, 320, 90, 320, 180]);
     const output = success('frame', rotated, '--at', '1', '--output', path.join(directory, 'out'));
-    const frame = jpegInfo(path.join(output.directory, 'frame-0000.jpg'));
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    const frame = jpegInfo(path.join(output.directory, manifest.frames[0].file));
     assert.ok(Math.abs(frame.width - 180) <= 2 && Math.abs(frame.height - 320) <= 2, `${frame.width}x${frame.height}`);
   });
+});
+
+test('a frame time that rounds up to a whole minute carries into the minutes', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'long.mp4');
+    ffmpeg('-f', 'lavfi', '-i', 'testsrc2=size=64x36:rate=1:duration=61', '-c:v', 'mpeg4', '-y', source);
+    const output = success('frame', source, '--at', '59.9996', '--output', path.join(directory, 'out'));
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    assert.deepEqual(manifest.frames, [{ file: 'frame-0000_01-00.000.jpg', time: 60, timecode: '01:00.000' }]);
+    jpegInfo(path.join(output.directory, manifest.frames[0].file));
+  });
+});
+
+test('timecodes gain an hour field and carry into it', () => {
+  assert.equal(formatTimecode(3599.9996), '1:00:00.000');
+  assert.equal(formatTimecode(3661.5), '1:01:01.500');
 });
 
 test('a streamed WebM without duration metadata uses packet timestamps', async () => {
@@ -162,7 +181,8 @@ test('anamorphic frames and contact sheets use square pixels', async () => {
     ffmpeg('-f', 'lavfi', '-i', 'testsrc2=size=160x90:rate=10:duration=1',
       '-vf', 'setsar=2/1', '-c:v', 'mpeg4', '-y', source);
     const output = success('overview', source, '--frames', '1', '--output', path.join(directory, 'out'));
-    const frame = jpegInfo(path.join(output.directory, 'frame-0000.jpg'));
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    const frame = jpegInfo(path.join(output.directory, manifest.frames[0].file));
     const sheet = jpegInfo(output.sheets[0]);
     for (const image of [frame, sheet]) {
       assert.equal(image.sample_aspect_ratio, '1:1');
@@ -183,6 +203,8 @@ test('inspect clips near the end and produces decodable JPEGs at the requested s
     for (const frame of manifest.frames) {
       jpegInfo(path.join(output.directory, frame.file));
     }
+    const names = manifest.frames.map((frame) => frame.file);
+    assert.deepEqual((await readdir(directory)).filter((file) => file.startsWith('frame-')).sort(), names);
   });
 });
 
@@ -196,10 +218,8 @@ test('overview writes a contact sheet and JPEGs mapped to source times', async (
     // 160x100 tiles: 2x3 (320x300) is closer to square than 3x2 (480x200).
     assert.equal(jpegInfo(output.sheets[0]).width, 320);
     for (const frame of manifest.frames) jpegInfo(path.join(output.directory, frame.file));
-    assert.deepEqual((await readdir(directory)).sort(), [
-      'frame-0000.jpg', 'frame-0001.jpg', 'frame-0002.jpg',
-      'frame-0003.jpg', 'frame-0004.jpg', 'manifest.json', 'sheet-01.jpg',
-    ]);
+    for (const frame of manifest.frames) assert.ok(frame.file.endsWith(`_${frame.timecode.replaceAll(':', '-')}.jpg`), frame.file);
+    assert.deepEqual((await readdir(directory)).sort(), [...manifest.frames.map((frame) => frame.file), 'manifest.json', 'sheet-01.jpg']);
   });
 });
 
@@ -271,7 +291,7 @@ test('default output goes under the git root .agvid folder and stays out of git 
     assert.equal(result.status, 0, result.stderr);
     const output = JSON.parse(result.stdout);
     assert.equal(path.dirname(output.directory), path.join(repo, '.agvid', 'runs'));
-    jpegInfo(path.join(output.directory, 'frame-0000.jpg'));
+    jpegInfo(path.join(output.directory, 'frame-0000_00-01.000.jpg'));
     assert.equal(await readFile(path.join(repo, '.agvid', '.gitignore'), 'utf8'), '*\n');
     await writeFile(path.join(sub, 'tracked.txt'), 'x');
     const status = spawnSync('git', ['status', '--porcelain', '--untracked-files=all'], { cwd: repo, encoding: 'utf8' });

@@ -30,6 +30,16 @@ export function parseTime(value) {
   return parts.reduce((seconds, part) => seconds * 60 + Number(part), 0);
 }
 
+const toMs = (seconds) => Math.round(seconds * 1000) / 1000;
+
+export function formatTimecode(seconds) {
+  const total = Math.round(seconds * 1000);
+  const pad = (value, size = 2) => String(value).padStart(size, '0');
+  const hours = Math.floor(total / 3600000);
+  const clock = `${pad(Math.floor(total / 60000) % 60)}:${pad(Math.floor(total / 1000) % 60)}.${pad(total % 1000, 3)}`;
+  return hours ? `${hours}:${clock}` : clock;
+}
+
 function numberOption(value, name, min, max, integer = false) {
   const number = Number(value);
   if (!Number.isFinite(number) || number < min || number > max || (integer && !Number.isInteger(number))) {
@@ -264,7 +274,7 @@ export async function main(args) {
   let times;
   if (command === 'overview') {
     const count = numberOption(options.frames ?? 12, 'frames', 1, 64, true);
-    times = Array.from({ length: count }, (_, i) => info.duration * (i + 0.5) / count);
+    times = Array.from({ length: count }, (_, i) => toMs(info.duration * (i + 0.5) / count));
   } else if (command === 'inspect') {
     if (options.around === undefined) throw new Error('inspect requires --around');
     const around = parseTime(options.around);
@@ -276,10 +286,11 @@ export async function main(args) {
     const count = Math.ceil((end - start) * fps);
     if (count < 1) throw new Error('inspect window contains no frames');
     if (count > 240) throw new Error('inspect would create over 240 frames; reduce --window or --fps');
-    times = Array.from({ length: count }, (_, i) => Math.min(end - 0.001, start + (i + 0.5) / fps));
+    // Rounding moves a time by at most 0.5 ms, so times stay ordered and below end.
+    times = Array.from({ length: count }, (_, i) => toMs(Math.min(end - 0.001, start + (i + 0.5) / fps)));
   } else {
     if (options.at === undefined) throw new Error('frame requires --at');
-    const at = parseTime(options.at);
+    const at = toMs(parseTime(options.at));
     if (at >= info.duration) throw new Error('--at must be before the video ends');
     times = [at];
   }
@@ -288,7 +299,8 @@ export async function main(args) {
   const produced = [];
   try {
     for (let i = 0; i < times.length; i++) {
-      const filename = `frame-${String(i).padStart(4, '0')}.jpg`;
+      const timecode = formatTimecode(times[i]);
+      const filename = `frame-${String(i).padStart(4, '0')}_${timecode.replaceAll(':', '-')}.jpg`;
       const target = path.join(directory, filename);
       produced.push(target);
       let extractionError;
@@ -299,7 +311,7 @@ export async function main(args) {
         await extract(video, Math.max(0, info.duration - 0.1), width, target);
       }
       if (!(await nonempty(target))) throw extractionError ?? new Error(`FFmpeg produced no frame for ${times[i]}s`);
-      frames.push({ file: filename, time: times[i] });
+      frames.push({ file: filename, time: times[i], timecode });
     }
     let sheets;
     if (command === 'overview') {
