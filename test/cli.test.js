@@ -330,6 +330,39 @@ test('a failed extraction removes directories agvid created and nothing else', a
   });
 });
 
+test('a failure mid-way through parallel extraction waits for in-flight jobs and removes the run', async () => {
+  await withTempDirectory(async (directory) => {
+    const real = spawnSync('sh', ['-c', 'command -v ffmpeg'], { encoding: 'utf8' }).stdout.trim();
+    assert.ok(real);
+    const bin = path.join(directory, 'bin');
+    const calls = path.join(directory, 'calls');
+    await mkdir(bin);
+    // mkdir is atomic, so exactly one concurrent call claims number 3 and fails fast while the others are still running.
+    await writeFile(path.join(bin, 'ffmpeg'), `#!/bin/sh
+n=1; while ! mkdir "${calls}/$n" 2>/dev/null; do n=$((n+1)); done
+[ "$n" -eq 3 ] && exit 1
+sleep 0.3
+exec "${real}" "$@"
+`);
+    await chmod(path.join(bin, 'ffmpeg'), 0o755);
+    const options = { cwd: directory, env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` } };
+    // An existing empty directory takes per-file cleanup, so a job still writing after cleanup would leave a JPEG behind.
+    const empty = path.join(directory, 'empty');
+    await mkdir(empty);
+    for (const output of [[], ['--output', path.join(directory, 'out')], ['--output', empty]]) {
+      await rm(calls, { recursive: true, force: true });
+      await mkdir(calls);
+      const failed = invokeIn(options, 'overview', video, '--frames', '8', '--width', '160', ...output);
+      assert.notEqual(failed.status, 0);
+      assert.match(failed.stderr, /ffmpeg exited 1/);
+      assert.ok((await readdir(calls)).length >= 3);
+    }
+    assert.deepEqual(await readdir(path.join(directory, '.agvid', 'runs')), []);
+    assert.deepEqual(await readdir(empty), []);
+    assert.deepEqual((await readdir(directory)).sort(), ['.agvid', 'bin', 'calls', 'empty']);
+  });
+});
+
 test('an unwritable project root fails with a clear error', { skip: process.getuid?.() === 0 }, async () => {
   await withTempDirectory(async (directory) => {
     await chmod(directory, 0o555);

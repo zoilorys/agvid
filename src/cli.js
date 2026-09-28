@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { mkdir, readFile, readdir, rename, rm, rmdir, stat, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -198,6 +199,24 @@ async function nonempty(filename) {
   catch (error) { if (error.code === 'ENOENT') return false; throw error; }
 }
 
+// Runs fn over items with bounded concurrency. After the first failure no new job starts;
+// it rejects with that error only once every started job has settled.
+async function pool(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0;
+  let failure;
+  const worker = async () => {
+    while (!failure && next < items.length) {
+      const i = next++;
+      try { results[i] = await fn(items[i], i); }
+      catch (error) { failure ??= { error }; }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  if (failure) throw failure.error;
+  return results;
+}
+
 const SHEET_BUDGET = 1568;
 
 export function sheetLayout(count, tileAspect, frameWidth, frameHeight) {
@@ -297,22 +316,23 @@ export async function main(args) {
   const { directory, created, firstParent } = await outputDirectory(video, command, options.output);
   const frames = [];
   const produced = [];
-  try {
-    for (let i = 0; i < times.length; i++) {
-      const timecode = formatTimecode(times[i]);
-      const filename = `frame-${String(i).padStart(4, '0')}_${timecode.replaceAll(':', '-')}.jpg`;
-      const target = path.join(directory, filename);
-      produced.push(target);
-      let extractionError;
-      try { await extract(video, times[i], width, target); }
-      catch (error) { extractionError = error; }
-      if (extractionError && await nonempty(target)) throw extractionError;
-      if (!(await nonempty(target)) && info.duration - times[i] < 0.1) {
-        await extract(video, Math.max(0, info.duration - 0.1), width, target);
-      }
-      if (!(await nonempty(target))) throw extractionError ?? new Error(`FFmpeg produced no frame for ${times[i]}s`);
-      frames.push({ file: filename, time: times[i], timecode });
+  const extractFrame = async (time, i) => {
+    const timecode = formatTimecode(time);
+    const filename = `frame-${String(i).padStart(4, '0')}_${timecode.replaceAll(':', '-')}.jpg`;
+    const target = path.join(directory, filename);
+    produced.push(target);
+    let extractionError;
+    try { await extract(video, time, width, target); }
+    catch (error) { extractionError = error; }
+    if (extractionError && await nonempty(target)) throw extractionError;
+    if (!(await nonempty(target)) && info.duration - time < 0.1) {
+      await extract(video, Math.max(0, info.duration - 0.1), width, target);
     }
+    if (!(await nonempty(target))) throw extractionError ?? new Error(`FFmpeg produced no frame for ${time}s`);
+    return { file: filename, time, timecode };
+  };
+  try {
+    frames.push(...await pool(times, Math.min(os.availableParallelism(), 8), extractFrame));
     let sheets;
     if (command === 'overview') {
       const size = await frameSize(path.join(directory, frames[0].file));
