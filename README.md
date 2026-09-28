@@ -10,7 +10,30 @@ Install Node.js 20 or newer, plus FFmpeg. Then install the CLI:
 npm install -g agvid
 ```
 
-For a checkout, run `npm link` from the repository root. The package also includes an agent skill at `skill/agvid/SKILL.md`. To install the skill for Codex, copy that directory into `~/.codex/skills/`.
+For a checkout, run `npm link` from the repository root.
+
+### Install the agent skill
+
+The package includes an agent skill at `skill/agvid/SKILL.md`. Copy it for your agent:
+
+```sh
+# Claude Code, user scope
+mkdir -p ~/.claude/skills && cp -R "$(npm root -g)/agvid/skill/agvid" ~/.claude/skills/
+
+# Claude Code, project scope (run from the project root)
+mkdir -p .claude/skills && cp -R "$(npm root -g)/agvid/skill/agvid" .claude/skills/
+
+# Codex
+mkdir -p ~/.codex/skills && cp -R "$(npm root -g)/agvid/skill/agvid" ~/.codex/skills/
+```
+
+Run these with the same Node and npm that installed agvid, since nvm and Volta keep global packages per version or tool. If the path is missing, find `agvid/skill/agvid` in your version manager's package directory.
+
+From a checkout, symlink instead so the skill tracks the repository (run from the repository root). This replaces any existing copy or link:
+
+```sh
+mkdir -p ~/.claude/skills && rm -rf ~/.claude/skills/agvid && ln -s "$PWD/skill/agvid" ~/.claude/skills/agvid
+```
 
 ## Inspect a video
 
