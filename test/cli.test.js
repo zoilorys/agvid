@@ -58,6 +58,7 @@ test('probe reports the real fixture and frame extracts a bounded JPEG at its re
     const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
     assert.deepEqual(manifest.frames, [{ file: 'frame-0000_00-07.500.jpg', time: 7.5, timecode: '00:07.500' }]);
     assert.deepEqual((await readdir(directory)).sort(), ['frame-0000_00-07.500.jpg', 'manifest.json']);
+    assert.ok(!('sheets' in output) && !('sheets' in manifest));
     const frame = jpegInfo(path.join(output.directory, manifest.frames[0].file));
     assert.ok(frame.width <= 160);
     assert.ok(Math.abs(frame.width / frame.height - info.width / info.height) < 0.03);
@@ -205,6 +206,15 @@ test('inspect clips near the end and produces decodable JPEGs at the requested s
     }
     const names = manifest.frames.map((frame) => frame.file);
     assert.deepEqual((await readdir(directory)).filter((file) => file.startsWith('frame-')).sort(), names);
+    assert.deepEqual(Object.keys(output), ['directory', 'sheets', 'manifest', 'frames']);
+    assert.deepEqual(output.sheets, manifest.sheets.map((sheet) => path.join(directory, sheet.file)));
+    let next = 0;
+    for (const sheet of manifest.sheets) {
+      assert.equal(sheet.frames[0], next);
+      next = sheet.frames[1] + 1;
+      jpegInfo(path.join(directory, sheet.file));
+    }
+    assert.equal(next, 5);
   });
 });
 

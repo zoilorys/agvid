@@ -380,7 +380,7 @@ export async function main(args) {
   try {
     frames.push(...await pool(times, Math.min(os.availableParallelism(), 8), extractFrame));
     let sheets;
-    if (command === 'overview') {
+    if (command !== 'frame') {
       const size = await frameSize(path.join(directory, frames[0].file));
       sheets = [];
       for (const [i, { first, last, layout }] of planSheets(frames.length, size.width, size.height).entries()) {
@@ -392,7 +392,7 @@ export async function main(args) {
     }
     produced.push(path.join(directory, 'manifest.json.tmp'), path.join(directory, 'manifest.json'));
     const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, frames, ...(sheets ? { sheets } : {}) });
-    console.log(JSON.stringify({ directory, manifest, ...(sheets ? { sheets: sheets.map((sheet) => path.join(directory, sheet.file)) } : {}), frames: frames.length }, null, 2));
+    console.log(JSON.stringify({ directory, ...(sheets ? { sheets: sheets.map((sheet) => path.join(directory, sheet.file)) } : {}), manifest, frames: frames.length }, null, 2));
   } catch (error) {
     if (created) {
       await rm(directory, { recursive: true, force: true })
