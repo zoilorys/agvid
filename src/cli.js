@@ -46,11 +46,13 @@ function parseArgs(args) {
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
     if (arg.startsWith('--')) {
-      const key = arg.slice(2);
-      if (!OPTIONS[command].has(key)) throw new Error(`unknown option: ${arg}`);
-      if (options[key] !== undefined) throw new Error(`duplicate option: ${arg}`);
-      const value = rest[++i];
-      if (!value || value.startsWith('--')) throw new Error(`missing value for ${arg}`);
+      const equals = arg.indexOf('=');
+      const key = equals < 0 ? arg.slice(2) : arg.slice(2, equals);
+      const name = `--${key}`;
+      if (!OPTIONS[command].has(key)) throw new Error(`unknown option: ${name}`);
+      if (options[key] !== undefined) throw new Error(`duplicate option: ${name}`);
+      const value = equals < 0 ? rest[++i] : arg.slice(equals + 1);
+      if (!value || (equals < 0 && value.startsWith('--'))) throw new Error(`missing value for ${name}`);
       options[key] = value;
     } else if (!video) video = arg;
     else throw new Error(`unexpected argument: ${arg}`);

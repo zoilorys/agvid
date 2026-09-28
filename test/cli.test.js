@@ -56,6 +56,19 @@ test('probe reports the real fixture and frame extracts a bounded JPEG at its re
   });
 });
 
+test('frame accepts --option=value spelling and rejects duplicates across spellings', async () => {
+  await withTempDirectory(async (directory) => {
+    const output = success('frame', video, '--at=7.5', '--width=160', `--output=${directory}`);
+    assert.equal(output.directory, directory);
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    assert.equal(manifest.frames[0].time, 7.5);
+    assert.ok(jpegInfo(path.join(output.directory, manifest.frames[0].file)).width <= 160);
+    const duplicate = invoke('frame', video, '--at', '1', '--at=2', '--output', path.join(directory, 'dup'));
+    assert.notEqual(duplicate.status, 0);
+    assert.match(duplicate.stderr, /duplicate option: --at\b/);
+  });
+});
+
 test('overview samples the video duration when audio continues after it', async () => {
   await withTempDirectory(async (directory) => {
     const source = path.join(directory, 'short-video.mp4');
