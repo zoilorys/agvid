@@ -72,7 +72,7 @@ test('overview samples the video duration when audio continues after it', async 
   });
 });
 
-test('probe reports displayed dimensions for a rotated video', async () => {
+test('probe reports displayed dimensions for a rotated video and frames are capped by displayed width', async () => {
   await withTempDirectory(async (directory) => {
     const plain = path.join(directory, 'plain.mp4');
     const rotated = path.join(directory, 'rotated.mp4');
@@ -80,6 +80,9 @@ test('probe reports displayed dimensions for a rotated video', async () => {
     ffmpeg('-display_rotation', '90', '-i', plain, '-c', 'copy', '-y', rotated);
     const info = success('probe', rotated);
     assert.deepEqual([info.width, info.height, info.rotation, info.codedWidth, info.codedHeight], [180, 320, 90, 320, 180]);
+    const output = success('frame', rotated, '--at', '1', '--output', path.join(directory, 'out'));
+    const frame = jpegInfo(path.join(output.directory, 'frame-0000.jpg'));
+    assert.ok(Math.abs(frame.width - 180) <= 2 && Math.abs(frame.height - 320) <= 2, `${frame.width}x${frame.height}`);
   });
 });
 
