@@ -145,10 +145,29 @@ export function sheetLayout(count, tileAspect, frameWidth, frameHeight) {
   return layout;
 }
 
-async function writeSheet(directory, files, name) {
+export function planSheets(count, frameWidth, frameHeight) {
+  const layout = (size) => sheetLayout(size, frameWidth / frameHeight, frameWidth, frameHeight);
+  // Tile rounding can shrink even a lone tile, so the minimum is what one tile actually reaches.
+  const single = layout(1);
+  const minimum = Math.min(320, Math.max(single.tileWidth, single.tileHeight));
+  for (let k = 1; ; k++) {
+    const small = Math.floor(count / k);
+    const sizes = Array.from({ length: k }, (_, i) => small + (i < count % k ? 1 : 0));
+    const layouts = sizes.map(layout);
+    if (k === count || layouts.every((l) => Math.max(l.tileWidth, l.tileHeight) >= minimum)) {
+      let first = 0;
+      return sizes.map((size, i) => ({ first, last: (first += size) - 1, layout: layouts[i] }));
+    }
+  }
+}
+
+async function frameSize(file) {
+  const { width, height } = JSON.parse(await run('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'json', file])).streams[0];
+  return { width, height };
+}
+
+async function writeSheet(directory, files, name, { columns, rows, tileWidth, tileHeight }) {
   const sheet = path.join(directory, name);
-  const first = JSON.parse(await run('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'json', path.join(directory, files[0])])).streams[0];
-  const { columns, rows, tileWidth, tileHeight } = sheetLayout(files.length, first.width / first.height, first.width, first.height);
   const inputs = files.flatMap((file) => ['-i', path.join(directory, file)]);
   const scaled = files.map((_, i) => `[${i}:v]scale=${tileWidth}:${tileHeight},setsar=1[v${i}];`).join('');
   const graph = `${scaled}${files.map((_, i) => `[v${i}]`).join('')}concat=n=${files.length}:v=1:a=0,tile=${columns}x${rows}`;
@@ -222,14 +241,20 @@ export async function main(args) {
       if (!(await nonempty(target))) throw extractionError ?? new Error(`FFmpeg produced no frame for ${times[i]}s`);
       frames.push({ file: filename, time: times[i] });
     }
-    let sheet;
+    let sheets;
     if (command === 'overview') {
-      produced.push(path.join(directory, 'contact-sheet.jpg'));
-      sheet = await writeSheet(directory, frames.map((frame) => frame.file), 'contact-sheet.jpg');
+      const size = await frameSize(path.join(directory, frames[0].file));
+      sheets = [];
+      for (const [i, { first, last, layout }] of planSheets(frames.length, size.width, size.height).entries()) {
+        const file = `sheet-${String(i + 1).padStart(2, '0')}.jpg`;
+        produced.push(path.join(directory, file));
+        await writeSheet(directory, frames.slice(first, last + 1).map((frame) => frame.file), file, layout);
+        sheets.push({ file, frames: [first, last], start: frames[first].time, end: frames[last].time });
+      }
     }
     produced.push(path.join(directory, 'manifest.json.tmp'), path.join(directory, 'manifest.json'));
-    const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, frames, ...(sheet ? { contactSheet: path.basename(sheet) } : {}) });
-    console.log(JSON.stringify({ directory, manifest, ...(sheet ? { contactSheet: sheet } : {}), frames: frames.length }, null, 2));
+    const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, frames, ...(sheets ? { sheets } : {}) });
+    console.log(JSON.stringify({ directory, manifest, ...(sheets ? { sheets: sheets.map((sheet) => path.join(directory, sheet.file)) } : {}), frames: frames.length }, null, 2));
   } catch (error) {
     await Promise.all(produced.map((file) => rm(file, { force: true }).catch(() => {})));
     throw error;

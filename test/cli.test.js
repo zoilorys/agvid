@@ -123,7 +123,7 @@ test('anamorphic frames and contact sheets use square pixels', async () => {
       '-vf', 'setsar=2/1', '-c:v', 'mpeg4', '-y', source);
     const output = success('overview', source, '--frames', '1', '--output', path.join(directory, 'out'));
     const frame = jpegInfo(path.join(output.directory, 'frame-0000.jpg'));
-    const sheet = jpegInfo(output.contactSheet);
+    const sheet = jpegInfo(output.sheets[0]);
     for (const image of [frame, sheet]) {
       assert.equal(image.sample_aspect_ratio, '1:1');
       assert.ok(Math.abs(image.width / image.height - 32 / 9) < 0.1);
@@ -151,22 +151,43 @@ test('overview writes a contact sheet and JPEGs mapped to source times', async (
     const output = success('overview', video, '--frames', '5', '--width', '160', '--output', directory);
     const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
     assert.equal(manifest.frames.length, 5);
-    assert.equal(manifest.contactSheet, 'contact-sheet.jpg');
+    assert.deepEqual(manifest.sheets.map((sheet) => [sheet.file, ...sheet.frames]), [['sheet-01.jpg', 0, 4]]);
     assert.ok(manifest.frames.every((frame) => frame.time > 0 && frame.time < manifest.source.duration));
     // 160x100 tiles: 2x3 (320x300) is closer to square than 3x2 (480x200).
-    assert.equal(jpegInfo(output.contactSheet).width, 320);
+    assert.equal(jpegInfo(output.sheets[0]).width, 320);
     for (const frame of manifest.frames) jpegInfo(path.join(output.directory, frame.file));
     assert.deepEqual((await readdir(directory)).sort(), [
-      'contact-sheet.jpg', 'frame-0000.jpg', 'frame-0001.jpg', 'frame-0002.jpg',
-      'frame-0003.jpg', 'frame-0004.jpg', 'manifest.json',
+      'frame-0000.jpg', 'frame-0001.jpg', 'frame-0002.jpg',
+      'frame-0003.jpg', 'frame-0004.jpg', 'manifest.json', 'sheet-01.jpg',
     ]);
   });
 });
 
-test('large overview sheet stays within the pixel budget', async () => {
+test('64-frame overview paginates into budgeted sheets covering every frame in order', async () => {
   await withTempDirectory(async (directory) => {
     const output = success('overview', video, '--frames', '64', '--output', directory);
-    const sheet = jpegInfo(output.contactSheet);
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    assert.ok(manifest.sheets.length >= 2 && manifest.sheets.length <= 4, `${manifest.sheets.length} sheets`);
+    assert.deepEqual(output.sheets, manifest.sheets.map((sheet) => path.join(directory, sheet.file)));
+    let next = 0;
+    for (const sheet of manifest.sheets) {
+      const [first, last] = sheet.frames;
+      assert.ok(first === next && last > first, JSON.stringify(sheet));
+      assert.equal(sheet.start, manifest.frames[first].time);
+      assert.equal(sheet.end, manifest.frames[last].time);
+      next = last + 1;
+      const image = jpegInfo(path.join(directory, sheet.file));
+      assert.ok(image.width <= 1568 && image.height <= 1568, `${image.width}x${image.height}`);
+    }
+    assert.equal(next, 64);
+  });
+});
+
+test('odd-width frames under the tile minimum still share one sheet', async () => {
+  await withTempDirectory(async (directory) => {
+    const output = success('overview', video, '--width', '101', '--output', directory);
+    assert.equal(output.sheets.length, 1);
+    const sheet = jpegInfo(output.sheets[0]);
     assert.ok(sheet.width <= 1568 && sheet.height <= 1568, `${sheet.width}x${sheet.height}`);
   });
 });
@@ -176,10 +197,16 @@ test('portrait source sheet is within budget and laid out wide', async () => {
     const source = path.join(directory, 'portrait.mp4');
     ffmpeg('-f', 'lavfi', '-i', 'testsrc2=size=360x640:rate=10:duration=2', '-c:v', 'mpeg4', '-y', source);
     const output = success('overview', source, '--output', path.join(directory, 'out'));
-    const sheet = jpegInfo(output.contactSheet);
+    assert.equal(output.sheets.length, 1);
+    const sheet = jpegInfo(output.sheets[0]);
     // 12 tiles at 360x640 exceed the height budget; a 4-column grid would be 1440x1920.
     assert.ok(sheet.width <= 1568 && sheet.height <= 1568, `${sheet.width}x${sheet.height}`);
     assert.ok(sheet.width >= sheet.height * 0.8, `${sheet.width}x${sheet.height}`);
+    // 65x116 frames round to 64x114 tiles; they must still share one sheet.
+    const small = success('overview', source, '--width', '65', '--output', path.join(directory, 'small'));
+    assert.equal(small.sheets.length, 1);
+    const smallSheet = jpegInfo(small.sheets[0]);
+    assert.ok(smallSheet.width <= 1568 && smallSheet.height <= 1568, `${smallSheet.width}x${smallSheet.height}`);
   });
 });
 
