@@ -255,12 +255,58 @@ async function frameSize(file) {
   return { width, height };
 }
 
-async function writeSheet(directory, files, name, { columns, rows, tileWidth, tileHeight }) {
+// 3x5 pixel font; ':' and '.' are one column wide. Tiles can be 64 px wide, so H:MM:SS.mmm must fit at scale 1.
+const GLYPHS = {
+  0: ['111', '101', '101', '101', '111'], 1: ['010', '110', '010', '010', '111'],
+  2: ['111', '001', '111', '100', '111'], 3: ['111', '001', '111', '001', '111'],
+  4: ['101', '101', '111', '001', '001'], 5: ['111', '100', '111', '001', '111'],
+  6: ['111', '100', '111', '101', '111'], 7: ['111', '001', '010', '010', '010'],
+  8: ['111', '101', '111', '101', '111'], 9: ['111', '101', '111', '001', '111'],
+  ':': ['0', '1', '0', '1', '0'], '.': ['0', '0', '0', '0', '1'],
+};
+
+const labelUnits = (text) => [...text].reduce((sum, char) => sum + GLYPHS[char][0].length + 1, 1);
+
+// White glyphs on a black box with one unit of padding and spacing, as a binary PGM.
+export function renderLabel(text, scale) {
+  const width = labelUnits(text) * scale;
+  const height = 7 * scale;
+  const pixels = Buffer.alloc(width * height);
+  let x = 1;
+  for (const char of text) {
+    const glyph = GLYPHS[char];
+    glyph.forEach((row, gy) => [...row].forEach((bit, gx) => {
+      if (bit !== '1') return;
+      for (let dy = 0; dy < scale; dy++) pixels.fill(255, ((1 + gy) * scale + dy) * width + (x + gx) * scale, ((1 + gy) * scale + dy) * width + (x + gx + 1) * scale);
+    }));
+    x += glyph[0].length + 1;
+  }
+  return Buffer.concat([Buffer.from(`P5\n${width} ${height}\n255\n`), pixels]);
+}
+
+export function labelScale(text, tileWidth, tileHeight) {
+  let scale = Math.max(2, Math.round(tileHeight * 0.04 / 5));
+  // 0 means no label: a clipped one could show a misleading timecode.
+  while (scale > 0 && (labelUnits(text) * scale > tileWidth || 7 * scale > tileHeight)) scale--;
+  return scale;
+}
+
+async function writeSheet(directory, frames, name, { columns, rows, tileWidth, tileHeight }, produced) {
   const sheet = path.join(directory, name);
-  const inputs = files.flatMap((file) => ['-i', path.join(directory, file)]);
-  const scaled = files.map((_, i) => `[${i}:v]scale=${tileWidth}:${tileHeight},setsar=1[v${i}];`).join('');
-  const graph = `${scaled}${files.map((_, i) => `[v${i}]`).join('')}concat=n=${files.length}:v=1:a=0,tile=${columns}x${rows}`;
-  await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', ...inputs, '-filter_complex', graph, '-frames:v', '1', '-threads:v', '1', '-q:v', '4', '-y', sheet]);
+  const labels = frames.map(({ timecode }, i) => ({ i, timecode, scale: labelScale(timecode, tileWidth, tileHeight),
+    file: path.join(directory, `.label-${path.parse(name).name}-${String(i).padStart(2, '0')}.pgm`) })).filter((label) => label.scale);
+  produced.push(...labels.map((label) => label.file));
+  try {
+    await Promise.all(labels.map((label) => writeFile(label.file, renderLabel(label.timecode, label.scale))));
+    const inputs = [...frames.map((frame) => path.join(directory, frame.file)), ...labels.map((label) => label.file)].flatMap((file) => ['-i', file]);
+    const n = frames.length;
+    const input = new Map(labels.map((label, k) => [label.i, n + k]));
+    const tiles = frames.map((_, i) => `[${i}:v]scale=${tileWidth}:${tileHeight},setsar=1${input.has(i) ? `[s${i}];[s${i}][${input.get(i)}:v]overlay=x=0:y=main_h-overlay_h` : ''}[v${i}];`).join('');
+    const graph = `${tiles}${frames.map((_, i) => `[v${i}]`).join('')}concat=n=${n}:v=1:a=0,tile=${columns}x${rows}`;
+    await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', ...inputs, '-filter_complex', graph, '-frames:v', '1', '-threads:v', '1', '-q:v', '4', '-y', sheet]);
+  } finally {
+    await Promise.all(labels.map((label) => rm(label.file, { force: true })));
+  }
   if (!(await nonempty(sheet))) throw new Error('FFmpeg produced no contact sheet');
   return sheet;
 }
@@ -340,8 +386,8 @@ export async function main(args) {
       for (const [i, { first, last, layout }] of planSheets(frames.length, size.width, size.height).entries()) {
         const file = `sheet-${String(i + 1).padStart(2, '0')}.jpg`;
         produced.push(path.join(directory, file));
-        await writeSheet(directory, frames.slice(first, last + 1).map((frame) => frame.file), file, layout);
-        sheets.push({ file, frames: [first, last], start: frames[first].time, end: frames[last].time });
+        await writeSheet(directory, frames.slice(first, last + 1), file, layout, produced);
+        sheets.push({ file, frames: [first, last], start: frames[first].time, end: frames[last].time, ...layout });
       }
     }
     produced.push(path.join(directory, 'manifest.json.tmp'), path.join(directory, 'manifest.json'));

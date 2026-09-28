@@ -223,6 +223,46 @@ test('overview writes a contact sheet and JPEGs mapped to source times', async (
   });
 });
 
+test('sheet tiles of a black clip are bright only in their bottom-left label boxes', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'black.mp4');
+    ffmpeg('-f', 'lavfi', '-i', 'color=black:size=320x180:rate=10:duration=4', '-c:v', 'mpeg4', '-y', source);
+    const out = path.join(directory, 'out');
+    const output = success('overview', source, '--frames', '6', '--output', out);
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    const [{ columns, rows, tileWidth, tileHeight }] = manifest.sheets;
+    const decoded = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-i', output.sheets[0], '-f', 'rawvideo', '-pix_fmt', 'gray', '-'], { encoding: 'buffer' });
+    assert.equal(decoded.status, 0, decoded.stderr.toString());
+    const width = columns * tileWidth;
+    assert.equal(decoded.stdout.length, width * rows * tileHeight);
+    const lit = new Array(6).fill(false);
+    for (let y = 0; y < rows * tileHeight; y++) {
+      for (let x = 0; x < width; x++) {
+        if (decoded.stdout[y * width + x] <= 128) continue;
+        const tile = Math.floor(y / tileHeight) * columns + Math.floor(x / tileWidth);
+        const inBox = tile < 6 && y % tileHeight >= tileHeight * 0.75 && x % tileWidth < tileWidth * 0.75;
+        assert.ok(inBox, `bright pixel outside label boxes at ${x},${y}`);
+        lit[tile] = true;
+      }
+    }
+    assert.deepEqual(lit, new Array(6).fill(true));
+    assert.deepEqual((await readdir(out)).filter((file) => !/^frame-.*\.jpg$/.test(file)).sort(), ['manifest.json', 'sheet-01.jpg']);
+  });
+});
+
+test('tiles too small for a whole label stay unlabeled', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'tiny.mp4');
+    ffmpeg('-f', 'lavfi', '-i', 'color=black:size=32x18:rate=10:duration=2', '-c:v', 'mpeg4', '-y', source);
+    const out = path.join(directory, 'out');
+    const output = success('overview', source, '--frames', '3', '--output', out);
+    const decoded = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-i', output.sheets[0], '-f', 'rawvideo', '-pix_fmt', 'gray', '-'], { encoding: 'buffer' });
+    assert.equal(decoded.status, 0, decoded.stderr.toString());
+    assert.ok(decoded.stdout.length > 0 && decoded.stdout.every((value) => value <= 128));
+    assert.deepEqual((await readdir(out)).filter((file) => !/^frame-.*\.jpg$/.test(file)).sort(), ['manifest.json', 'sheet-01.jpg']);
+  });
+});
+
 test('64-frame overview paginates into budgeted sheets covering every frame in order', async () => {
   await withTempDirectory(async (directory) => {
     const output = success('overview', video, '--frames', '64', '--output', directory);
