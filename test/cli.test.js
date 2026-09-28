@@ -45,6 +45,9 @@ test('probe reports the real fixture and frame extracts a bounded JPEG at its re
     assert.ok(info.duration > 25.5 && info.duration < 25.7);
     assert.ok(info.width > 0 && info.height > 0);
     assert.ok(info.codec);
+    // The fixture is VFR: avg_frame_rate 16332/307 differs from r_frame_rate 60/1.
+    assert.equal(info.fps, 53.199);
+    assert.deepEqual([info.frameCount, info.frameCountEstimated, info.hasAudio], [1361, false, false]);
 
     const output = success('frame', video, '--at', '00:07.5004', '--width', '160', '--output', directory);
     const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
@@ -77,6 +80,7 @@ test('overview samples the video duration when audio continues after it', async 
       '-c:v', 'mpeg4', '-c:a', 'aac', '-y', source);
     const info = success('probe', source);
     assert.ok(info.duration >= 0.9 && info.duration <= 1.1);
+    assert.deepEqual([info.fps, info.frameCount, info.hasAudio], [10, 10, true]);
     const output = success('overview', source, '--frames', '3', '--output', path.join(directory, 'out'));
     const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
     assert.equal(manifest.frames.length, 3);
@@ -109,6 +113,7 @@ test('a streamed WebM without duration metadata uses packet timestamps', async (
     const info = success('probe', source);
     assert.equal(info.durationSource, 'packets');
     assert.ok(info.duration >= 1.95 && info.duration <= 2.05, String(info.duration));
+    assert.deepEqual([info.fps, info.frameCount, info.frameCountEstimated], [10, 20, true]);
     const output = success('overview', source, '--frames', '3', '--output', path.join(directory, 'out'));
     const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
     assert.equal(manifest.frames.length, 3);

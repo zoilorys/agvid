@@ -74,9 +74,10 @@ function run(program, args) {
 }
 
 async function probe(video) {
-  const raw = await run('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,avg_frame_rate,codec_name,duration:stream_side_data=rotation:stream_tags=DURATION,rotate', '-of', 'json', video]);
-  const data = JSON.parse(raw);
-  const stream = data.streams?.[0];
+  // No -select_streams: the full listing also reveals audio. The first video stream matches FFmpeg's 0:v:0.
+  const raw = await run('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,width,height,avg_frame_rate,codec_name,duration,nb_frames,pix_fmt,bits_per_raw_sample:stream_side_data=rotation:stream_tags=DURATION,rotate', '-of', 'json', video]);
+  const streams = JSON.parse(raw).streams ?? [];
+  const stream = streams.find((entry) => entry.codec_type === 'video');
   if (!stream) throw new Error('no video stream found');
   const valid = (value) => Number.isFinite(value) && value > 0;
   let duration = Number(stream.duration);
@@ -99,8 +100,18 @@ async function probe(video) {
   const rawRotation = Number(stream.side_data_list?.find((entry) => entry.rotation !== undefined)?.rotation ?? stream.tags?.rotate ?? 0);
   const rotation = Number.isFinite(rawRotation) ? ((Math.round(rawRotation) % 360) + 360) % 360 : 0;
   const swap = rotation === 90 || rotation === 270;
+  const [numerator, denominator] = String(stream.avg_frame_rate ?? '').split('/').map(Number);
+  const rate = numerator / denominator;
+  const fps = Number.isFinite(rate) && rate > 0 ? Math.round(rate * 1000) / 1000 : null;
+  const counted = Number(stream.nb_frames);
+  const frameCountEstimated = !(Number.isInteger(counted) && counted > 0);
+  const frameCount = frameCountEstimated ? (fps === null ? null : Math.round(duration * rate)) : counted;
+  const bitDepth = Number(stream.bits_per_raw_sample);
   return { video, duration, width: swap ? stream.height : stream.width, height: swap ? stream.width : stream.height,
-    rotation, codedWidth: stream.width, codedHeight: stream.height, fps: stream.avg_frame_rate, codec: stream.codec_name, durationSource };
+    rotation, codedWidth: stream.width, codedHeight: stream.height, fps, frameRate: stream.avg_frame_rate ?? null,
+    frameCount, frameCountEstimated, codec: stream.codec_name, pixelFormat: stream.pix_fmt ?? null,
+    bitDepth: Number.isInteger(bitDepth) && bitDepth > 0 ? bitDepth : null,
+    hasAudio: streams.some((entry) => entry.codec_type === 'audio'), durationSource };
 }
 
 async function packetDuration(video) {
