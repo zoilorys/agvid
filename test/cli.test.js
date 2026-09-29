@@ -359,6 +359,29 @@ test('overview writes a contact sheet and JPEGs mapped to source times', async (
   });
 });
 
+test('overview samples only the requested section and rejects bad ranges before output', async () => {
+  await withTempDirectory(async (directory) => {
+    const output = success('overview', video, '--start=10', '--end', '00:20', '--frames', '5', '--width', '160', '--output', path.join(directory, 'ok'));
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    assert.deepEqual(manifest.range, { start: 10, end: 20 });
+    assert.deepEqual(manifest.frames.map((frame) => frame.time), [11, 13, 15, 17, 19]);
+
+    const clamped = success('overview', video, '--start', '20', '--end', '999', '--frames', '2', '--width', '160', '--output', path.join(directory, 'clamped'));
+    const clampedManifest = JSON.parse(await readFile(clamped.manifest, 'utf8'));
+    assert.equal(clampedManifest.range.start, 20);
+    assert.ok(Math.abs(clampedManifest.range.end - clampedManifest.source.duration) < 0.001);
+    assert.ok(clampedManifest.frames.every((frame) => frame.time > 20 && frame.time < clampedManifest.source.duration));
+
+    for (const args of [['--start', '20', '--end', '10'], ['--start', '10', '--end', '10'], ['--start', '99']]) {
+      const bad = invoke('overview', video, ...args, '--output', path.join(directory, 'bad'));
+      assert.notEqual(bad.status, 0);
+      assert.match(bad.stderr, /--start/);
+    }
+    assert.deepEqual((await readdir(directory)).sort(), ['clamped', 'ok']);
+    assert.ok(!('range' in JSON.parse(await readFile(success('overview', video, '--frames', '1', '--width', '160', '--output', path.join(directory, 'plain')).manifest, 'utf8'))));
+  });
+});
+
 test('sheet tiles of a black clip are bright only in their bottom-left label boxes', async () => {
   await withTempDirectory(async (directory) => {
     const source = path.join(directory, 'black.mp4');

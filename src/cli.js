@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 const HELP = `agvid <command> <video> [options]
 
 Commands:
-  overview [--frames N] [--width PX] [--output DIR] <video>
+  overview [--frames N] [--start TIME] [--end TIME] [--width PX] [--output DIR] <video>
   inspect <video> --around TIME [--window DURATION] [--fps N] [--width PX] [--output DIR]
   frame <video> --at TIME [--width PX] [--output DIR]
   probe <video>...
@@ -19,7 +19,7 @@ sheet-NN.jpg. Output defaults to .agvid/runs/ under the git root (else cwd); --o
 must be new or empty. FFmpeg and FFprobe must be available on PATH.`;
 
 const OPTIONS = {
-  overview: new Set(['frames', 'width', 'output']),
+  overview: new Set(['frames', 'start', 'end', 'width', 'output']),
   inspect: new Set(['around', 'window', 'fps', 'width', 'output']),
   frame: new Set(['at', 'width', 'output']),
   probe: new Set(),
@@ -51,6 +51,15 @@ function numberOption(value, name, min, max, integer = false) {
     throw new Error(`--${name} must be ${integer ? 'an integer' : 'a number'} from ${min} to ${max}`);
   }
   return number;
+}
+
+// Resolves optional --start/--end to { start, end } seconds within the video; end is clamped to the duration.
+export function resolveRange(options, info) {
+  const start = options.start === undefined ? 0 : toMs(parseTime(options.start));
+  const end = options.end === undefined ? info.duration : Math.min(info.duration, toMs(parseTime(options.end)));
+  if (start >= info.duration) throw new Error(`--start ${formatTimecode(start)} must be before the video ends`);
+  if (start >= end) throw new Error(`--start ${formatTimecode(start)} must be before --end ${formatTimecode(end)}`);
+  return { start, end };
 }
 
 function parseArgs(args) {
@@ -359,9 +368,11 @@ export async function main(args) {
   const width = Math.min(info.width, numberOption(options.width ?? 640, 'width', 64, 4096, true));
   let times;
   let windows;
+  let range;
   if (command === 'overview') {
     const count = numberOption(options.frames ?? 12, 'frames', 1, 64, true);
-    times = Array.from({ length: count }, (_, i) => toMs(info.duration * (i + 0.5) / count));
+    const { start, end } = range = resolveRange(options, info);
+    times = Array.from({ length: count }, (_, i) => toMs(start + (end - start) * (i + 0.5) / count));
   } else if (command === 'inspect') {
     if (options.around === undefined) throw new Error('inspect requires --around');
     const arounds = [...new Set(options.around.map((value) => toMs(parseTime(value))))].sort((a, b) => a - b);
@@ -431,7 +442,7 @@ export async function main(args) {
       }
     }
     produced.push(path.join(directory, 'manifest.json.tmp'), path.join(directory, 'manifest.json'));
-    const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, frames, ...(windows ? { windows } : {}), ...(sheets ? { sheets } : {}) });
+    const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, ...(range && (options.start !== undefined || options.end !== undefined) ? { range: { start: toMs(range.start), end: toMs(range.end) } } : {}), frames, ...(windows ? { windows } : {}), ...(sheets ? { sheets } : {}) });
     console.log(JSON.stringify({ directory, ...(sheets ? { sheets: sheets.map((sheet) => path.join(directory, sheet.file)) } : {}), manifest, frames: frames.length }, null, 2));
   } catch (error) {
     if (created) {
