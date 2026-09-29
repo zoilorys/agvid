@@ -10,20 +10,25 @@ Commands:
   overview [--frames N] [--start TIME] [--end TIME] [--crop X,Y,W,H] [--width PX] [--output DIR] <video>
   inspect <video> (--around TIME [--window DURATION] | --start TIME [--end TIME]) [--fps N] [--crop X,Y,W,H] [--width PX] [--output DIR]
   frame <video> --at TIME [--crop X,Y,W,H] [--width PX] [--output DIR]
+  changes <video> [--start TIME] [--end TIME] [--crop X,Y,W,H] [--threshold X] [--min-gap DURATION] [--max N] [--width PX] [--output DIR]
   probe <video>...
 
+changes writes the range start plus each frame where over --threshold (default 0.002) of the
+picture differs from the last reported frame, at least --min-gap (default 0.5s) apart; --max
+(default 48, up to 240) keeps the highest scores. --crop limits detection to the region.
 TIME accepts seconds or HH:MM:SS.s. DURATION accepts seconds, with optional s suffix.
 --crop takes fractions 0-1 of the displayed frame (left, top, width, height) and cuts
 that region at source resolution before --width scaling; it is never enlarged.
 --window is the total duration centered on --around. Options also accept --key=value.
 Writes JPEG frames and manifest.json; overview and inspect also write timecode-labeled
-sheet-NN.jpg. Output defaults to .agvid/runs/ under the git root (else cwd); --output DIR
+sheet-NN.jpg (changes too). Output defaults to .agvid/runs/ under the git root (else cwd); --output DIR
 must be new or empty. FFmpeg and FFprobe must be available on PATH.`;
 
 const OPTIONS = {
   overview: new Set(['frames', 'start', 'end', 'crop', 'width', 'output']),
   inspect: new Set(['around', 'window', 'fps', 'start', 'end', 'crop', 'width', 'output']),
   frame: new Set(['at', 'crop', 'width', 'output']),
+  changes: new Set(['start', 'end', 'crop', 'threshold', 'min-gap', 'max', 'width', 'output']),
   probe: new Set(),
 };
 
@@ -247,6 +252,100 @@ async function extract(video, time, width, filename, crop) {
   await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-ss', String(time), '-i', video, '-map', '0:v:0', '-frames:v', '1', '-vf', `${cut}scale=${width}:max(2\\,round(${width}/dar/2)*2),setsar=1`, '-threads:v', '1', '-q:v', '4', '-y', filename]);
 }
 
+const ANALYSIS_FPS = 10;
+const ANALYSIS_WIDTH = 160;
+const PIXEL_DELTA = 16;
+
+// One decode pass over the range: 160-px-wide gray source frames thinned to at most 10/s (select keeps source pts;
+// no fps resampling), each scored as the share of pixels differing by more than 16/255 from the last reported frame
+// (initially the first decoded one, at the range start). Times are source pts from showinfo, which -ss input seeking
+// makes relative to the range start. Streams rawvideo; keeps only the
+// reference frame and frames still waiting for their pts line.
+function detectChanges(video, info, range, crop, { threshold, minGap }) {
+  const sourceWidth = crop?.pixels.width ?? info.width;
+  const sourceHeight = crop?.pixels.height ?? info.height;
+  const height = Math.max(2, Math.round(ANALYSIS_WIDTH * sourceHeight / sourceWidth / 2) * 2);
+  const size = ANALYSIS_WIDTH * height;
+  const cut = crop ? `crop=${crop.pixels.width}:${crop.pixels.height}:${crop.pixels.x}:${crop.pixels.y},` : '';
+  const args = ['-hide_banner', '-nostats', '-loglevel', 'info', '-ss', String(range.start), '-to', String(range.end), '-i', video,
+    '-map', '0:v:0', '-vf', `${cut}select='isnan(prev_selected_t)+gte(t-prev_selected_t,${1 / ANALYSIS_FPS - 1e-6})',scale=${ANALYSIS_WIDTH}:${height},format=gray,showinfo`,
+    '-fps_mode', 'passthrough', '-threads:v', '1', '-f', 'rawvideo', '-pix_fmt', 'gray', '-'];
+  return new Promise((resolve, reject) => {
+    const child = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const pendingFrames = [];
+    const pendingTimes = [];
+    const events = [];
+    const errors = [];
+    let decoded = 0;
+    let failed;
+    let reference;
+    let lastReport = range.start;
+    let partial = Buffer.alloc(size);
+    let filled = 0;
+    let line = '';
+    const score = (frame) => {
+      let changed = 0;
+      for (let i = 0; i < size; i++) if (Math.abs(frame[i] - reference[i]) > PIXEL_DELTA) changed++;
+      return changed / size;
+    };
+    const drain = () => {
+      while (pendingFrames.length && pendingTimes.length) {
+        const frame = pendingFrames.shift();
+        // Floor so a later `-ss time` never lands just after this frame's pts.
+        const time = Math.floor((range.start + pendingTimes.shift()) * 1000 + 1e-6) / 1000;
+        decoded++;
+        if (!reference) { reference = frame; continue; }
+        if (!(time > range.start && time < range.end) || time - lastReport < minGap - 1e-9) continue;
+        const value = score(frame);
+        if (value > threshold) {
+          events.push({ time, score: Math.round(value * 1e6) / 1e6 });
+          reference = frame;
+          lastReport = time;
+        }
+      }
+    };
+    child.stdout.on('data', (chunk) => {
+      for (let offset = 0; offset < chunk.length;) {
+        const count = Math.min(size - filled, chunk.length - offset);
+        chunk.copy(partial, filled, offset, offset + count);
+        filled += count;
+        offset += count;
+        if (filled === size) { pendingFrames.push(partial); partial = Buffer.alloc(size); filled = 0; }
+      }
+      drain();
+      if (pendingFrames.length > 64 && !failed) {
+        failed = new Error('ffmpeg frame/pts mismatch: frames arrived without showinfo times');
+        child.kill();
+      }
+    });
+    child.stderr.on('data', (chunk) => {
+      const lines = (line + chunk).split('\n');
+      line = lines.pop();
+      for (const text of lines) {
+        if (/Parsed_showinfo/.test(text)) {
+          const match = /\bn:\s*\d+\s+pts:\s*-?\d+\s+pts_time:\s*(-?[\d.e+-]+)/.exec(text);
+          if (match) pendingTimes.push(Number(match[1]));
+        } else if (text.trim()) {
+          errors.push(text.trim());
+          if (errors.length > 20) errors.shift();
+        }
+      }
+      drain();
+    });
+    child.on('error', (error) => reject(new Error(`ffmpeg: ${error.message}`)));
+    child.on('close', (code) => {
+      if (failed) return reject(failed);
+      if (code !== 0) return reject(new Error(`ffmpeg exited ${code}: ${errors.join('\n')}`));
+      drain();
+      if (pendingFrames.length || pendingTimes.length || filled) {
+        return reject(new Error(`ffmpeg frame/pts mismatch: ${pendingFrames.length} frames and ${pendingTimes.length} times unpaired, ${filled} trailing bytes`));
+      }
+      if (!decoded) return reject(new Error(`no decodable frames between ${formatTimecode(range.start)} and ${formatTimecode(range.end)}`));
+      resolve(events);
+    });
+  });
+}
+
 async function nonempty(filename) {
   try { return (await stat(filename)).size > 0; }
   catch (error) { if (error.code === 'ENOENT') return false; throw error; }
@@ -400,6 +499,8 @@ export async function main(args) {
   let times;
   let windows;
   let range;
+  let scores;
+  let detection;
   if (command === 'overview') {
     const count = numberOption(options.frames ?? 12, 'frames', 1, 64, true);
     const { start, end } = range = resolveRange(options, info);
@@ -430,6 +531,18 @@ export async function main(args) {
       for (let i = 0; i < count; i++) times.push(toMs(Math.min(end - 0.001, start + (i + 0.5) / fps)));
       windows.push({ around, start: toMs(start), end: toMs(end), frames: [first, times.length - 1] });
     }
+  } else if (command === 'changes') {
+    const threshold = Number(options.threshold ?? 0.002);
+    if (!(threshold > 0 && threshold <= 1)) throw new Error('--threshold must be a fraction above 0 and at most 1');
+    const minGap = numberOption(parseTime(options['min-gap'] ?? '0.5'), 'min-gap', 0, 3600);
+    const max = numberOption(options.max ?? 48, 'max', 1, 240, true);
+    range = resolveRange(options, info);
+    const found = await detectChanges(video, info, range, crop, { threshold, minGap });
+    const truncated = found.length > max;
+    const kept = truncated ? [...found].sort((a, b) => b.score - a.score || a.time - b.time).slice(0, max).sort((a, b) => a.time - b.time) : found;
+    times = [range.start, ...kept.map((event) => event.time)];
+    scores = [null, ...kept.map((event) => event.score)];
+    detection = { metric: `gray-diff>${PIXEL_DELTA}@${ANALYSIS_WIDTH}px,${ANALYSIS_FPS}fps vs last detected candidate`, threshold, minGap, candidates: found.length, truncated };
   } else {
     if (options.at === undefined) throw new Error('frame requires --at');
     times = [...new Set(options.at.map((value) => {
@@ -459,6 +572,7 @@ export async function main(args) {
   };
   try {
     frames.push(...await pool(times, Math.min(os.availableParallelism(), 8), extractFrame));
+    if (scores) frames.forEach((frame, i) => { frame.score = scores[i]; });
     let sheets;
     if (command !== 'frame' || frames.length > 1) {
       const size = await frameSize(path.join(directory, frames[0].file));
@@ -480,8 +594,8 @@ export async function main(args) {
       }
     }
     produced.push(path.join(directory, 'manifest.json.tmp'), path.join(directory, 'manifest.json'));
-    const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, ...(crop ? { crop } : {}), ...(range && (options.start !== undefined || options.end !== undefined) ? { range: { start: toMs(range.start), end: toMs(range.end) } } : {}), frames, ...(windows ? { windows } : {}), ...(sheets ? { sheets } : {}) });
-    console.log(JSON.stringify({ directory, ...(sheets ? { sheets: sheets.map((sheet) => path.join(directory, sheet.file)) } : {}), manifest, frames: frames.length }, null, 2));
+    const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, ...(crop ? { crop } : {}), ...(range && (options.start !== undefined || options.end !== undefined) ? { range: { start: toMs(range.start), end: toMs(range.end) } } : {}), ...(detection ? { detection } : {}), frames, ...(windows ? { windows } : {}), ...(sheets ? { sheets } : {}) });
+    console.log(JSON.stringify({ directory, ...(sheets ? { sheets: sheets.map((sheet) => path.join(directory, sheet.file)) } : {}), manifest, frames: frames.length, ...(detection ? { changes: frames.length - 1 } : {}) }, null, 2));
   } catch (error) {
     if (created) {
       await rm(directory, { recursive: true, force: true })

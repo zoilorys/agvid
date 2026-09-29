@@ -508,6 +508,119 @@ test('inspect by explicit range samples one window and rejects mixing with --aro
   });
 });
 
+// 1280x720 at 10 fps: an 80x40 toast inside the top-left quarter from 1.5 s, a 400x300 panel outside it from 3 s.
+function uiClip(directory) {
+  const source = path.join(directory, 'ui.mp4');
+  ffmpeg('-f', 'lavfi', '-i', 'color=black:size=1280x720:rate=10:duration=4.5',
+    '-vf', "drawbox=x=40:y=40:w=80:h=40:color=white:t=fill:enable='gte(t,1.5)',drawbox=x=700:y=300:w=400:h=300:color=white:t=fill:enable='gte(t,3)'",
+    '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', source);
+  return source;
+}
+
+async function changesManifest(output) {
+  const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+  assert.equal(output.changes, manifest.frames.length - 1);
+  assert.deepEqual([manifest.frames[0].time, manifest.frames[0].score], [manifest.range?.start ?? 0, null]);
+  for (const frame of manifest.frames.slice(1)) assert.ok(frame.score > manifest.detection.threshold, JSON.stringify(frame));
+  for (const file of [...manifest.frames.map((frame) => frame.file), ...manifest.sheets.map((sheet) => sheet.file)]) jpegInfo(path.join(output.directory, file));
+  return manifest;
+}
+
+test('changes finds small and large UI changes', async () => {
+  await withTempDirectory(async (directory) => {
+    const output = success('changes', uiClip(directory), '--width', '160', '--output', path.join(directory, 'out'));
+    const manifest = await changesManifest(output);
+    assert.equal(output.changes, 2);
+    const [toast, panel] = manifest.frames.slice(1).map((frame) => frame.time);
+    assert.ok(Math.abs(toast - 1.5) <= 0.1 && Math.abs(panel - 3) <= 0.1, `${toast} ${panel}`);
+    assert.deepEqual([manifest.detection.threshold, manifest.detection.minGap, manifest.detection.candidates, manifest.detection.truncated], [0.002, 0.5, 2, false]);
+  });
+});
+
+test('crop restricts detection and ranges bound it', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = uiClip(directory);
+    const output = success('changes', source, '--crop=0,0,0.25,0.25', '--threshold=0.002', '--min-gap=0.5', '--output', path.join(directory, 'crop'));
+    const manifest = await changesManifest(output);
+    assert.equal(output.changes, 1);
+    assert.ok(Math.abs(manifest.frames[1].time - 1.5) <= 0.1, String(manifest.frames[1].time));
+    assert.deepEqual(manifest.crop.pixels, { x: 0, y: 0, width: 320, height: 180, displayed: { width: 320, height: 180 } });
+
+    const ranged = success('changes', source, '--start', '2', '--end', '4', '--width', '160', '--output', path.join(directory, 'range'));
+    const rangedManifest = await changesManifest(ranged);
+    assert.deepEqual(rangedManifest.range, { start: 2, end: 4 });
+    assert.equal(ranged.changes, 1);
+    assert.ok(Math.abs(rangedManifest.frames[1].time - 3) <= 0.1, String(rangedManifest.frames[1].time));
+
+    for (const args of [['--threshold', '0'], ['--threshold', '1.5'], ['--max', '241'], ['--min-gap', '-1']]) {
+      const bad = invoke('changes', source, ...args, '--output', path.join(directory, 'bad'));
+      assert.notEqual(bad.status, 0);
+    }
+    assert.deepEqual((await readdir(directory)).sort(), ['crop', 'range', 'ui.mp4']);
+  });
+});
+
+test('static clip yields only baseline', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'static.mp4');
+    ffmpeg('-f', 'lavfi', '-i', 'smptebars=size=320x180:rate=10:duration=4', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', source);
+    const output = success('changes', source, '--output', path.join(directory, 'out'));
+    const manifest = await changesManifest(output);
+    assert.equal(output.changes, 0);
+    assert.equal(manifest.frames.length, 1);
+    assert.deepEqual([manifest.detection.candidates, manifest.detection.truncated], [0, false]);
+  });
+});
+
+test('max truncates by score', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'flash.mp4');
+    // A 16x16 box toggles every frame (over 100 small changes); a 160x120 panel shows only on frames 5, 15, 25...,
+    // so frames 5 and 6 of each ten differ from the last candidate by the whole panel.
+    ffmpeg('-f', 'lavfi', '-i', 'color=black:size=320x180:rate=10:duration=12',
+      '-vf', "drawbox=x=10:y=10:w=16:h=16:color=white:t=fill:enable='mod(n,2)',drawbox=x=120:y=40:w=160:h=120:color=white:t=fill:enable='eq(mod(n,10),5)'",
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', source);
+    const output = success('changes', source, '--min-gap=0', '--max', '10', '--output', path.join(directory, 'out'));
+    const manifest = await changesManifest(output);
+    assert.equal(output.changes, 10);
+    assert.equal(manifest.detection.truncated, true);
+    assert.ok(manifest.detection.candidates >= 100, String(manifest.detection.candidates));
+    const kept = manifest.frames.slice(1);
+    for (const frame of kept) {
+      assert.ok(frame.score > 0.2, JSON.stringify(frame));
+      assert.ok([5, 6].includes(Math.round(frame.time * 10) % 10), JSON.stringify(frame));
+    }
+    const times = manifest.frames.map((frame) => frame.time);
+    assert.ok(times.every((time, i) => i === 0 || time > times[i - 1]), times.join());
+
+    const gapped = success('changes', source, '--min-gap', '1', '--max', '240', '--output', path.join(directory, 'gap'));
+    const gappedManifest = await changesManifest(gapped);
+    const gappedTimes = gappedManifest.frames.map((frame) => frame.time);
+    assert.ok(gappedTimes.length > 2);
+    assert.ok(gappedTimes.every((time, i) => i === 0 || time - gappedTimes[i - 1] >= 1 - 1e-9), gappedTimes.join());
+    assert.ok(gappedManifest.detection.candidates < manifest.detection.candidates);
+  });
+});
+
+test('changes on a sparse VFR clip reports source frame times and extracts those frames', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'sparse.mp4');
+    // Frames only at 0, 1.47 and 3.0 s: box A from 1.47 s, box B added at 3.0 s.
+    ffmpeg('-f', 'lavfi', '-i', 'color=black:size=320x180:rate=100:duration=3.5',
+      '-vf', "drawbox=x=20:y=20:w=80:h=60:color=white:t=fill:enable='gte(n,147)',drawbox=x=200:y=100:w=80:h=60:color=white:t=fill:enable='gte(n,300)',select='eq(n,0)+eq(n,147)+eq(n,300)'",
+      '-fps_mode', 'vfr', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', source);
+    const output = success('changes', source, '--width', '320', '--output', path.join(directory, 'out'));
+    const manifest = await changesManifest(output);
+    const first = manifest.frames[1];
+    assert.ok(Math.abs(first.time - 1.47) <= 0.001, String(first.time));
+    const decoded = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-i', path.join(output.directory, first.file),
+      '-vf', 'scale=320:180', '-f', 'rawvideo', '-pix_fmt', 'gray', '-'], { encoding: 'buffer' });
+    assert.equal(decoded.status, 0, decoded.stderr.toString());
+    assert.ok(decoded.stdout[50 * 320 + 60] > 128, 'box A lit');
+    assert.ok(decoded.stdout[130 * 320 + 240] < 64, 'box B not yet shown');
+  });
+});
+
 test('sheet tiles of a black clip are bright only in their bottom-left label boxes', async () => {
   await withTempDirectory(async (directory) => {
     const source = path.join(directory, 'black.mp4');
