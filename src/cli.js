@@ -25,6 +25,8 @@ const OPTIONS = {
   probe: new Set(),
 };
 
+const MULTI = new Set(['at', 'around']);
+
 export function parseTime(value) {
   const parts = String(value).replace(/s$/, '').split(':');
   if (parts.length > 3 || parts.some((part) => !/^\d+(?:\.\d+)?$/.test(part))) {
@@ -63,10 +65,14 @@ function parseArgs(args) {
       const key = equals < 0 ? arg.slice(2) : arg.slice(2, equals);
       const name = `--${key}`;
       if (!OPTIONS[command].has(key)) throw new Error(`unknown option: ${name}`);
-      if (options[key] !== undefined) throw new Error(`duplicate option: ${name}`);
+      if (!MULTI.has(key) && options[key] !== undefined) throw new Error(`duplicate option: ${name}`);
       const value = equals < 0 ? rest[++i] : arg.slice(equals + 1);
       if (!value || (equals < 0 && value.startsWith('--'))) throw new Error(`missing value for ${name}`);
-      options[key] = value;
+      if (MULTI.has(key)) {
+        const items = value.split(',');
+        if (items.some((item) => !item)) throw new Error(`empty item in ${name}: ${value}`);
+        (options[key] ??= []).push(...items);
+      } else options[key] = value;
     } else if (!video) video = arg;
     else throw new Error(`unexpected argument: ${arg}`);
   }
@@ -332,6 +338,9 @@ export async function main(args) {
     return;
   }
   const { command, video, options } = parseArgs(args);
+  for (const key of MULTI) {
+    if (options[key]?.length > 1) throw new Error(`multiple --${key} values are not supported yet`);
+  }
   const info = await probe(video);
   if (command === 'probe') {
     console.log(JSON.stringify(info, null, 2));
@@ -344,7 +353,7 @@ export async function main(args) {
     times = Array.from({ length: count }, (_, i) => toMs(info.duration * (i + 0.5) / count));
   } else if (command === 'inspect') {
     if (options.around === undefined) throw new Error('inspect requires --around');
-    const around = parseTime(options.around);
+    const around = parseTime(options.around[0]);
     const window = numberOption(parseTime(options.window ?? '2s'), 'window', 0.001, 3600);
     const fps = numberOption(options.fps ?? 4, 'fps', 0.1, 60);
     if (around > info.duration) throw new Error('--around is beyond the video duration');
@@ -357,7 +366,7 @@ export async function main(args) {
     times = Array.from({ length: count }, (_, i) => toMs(Math.min(end - 0.001, start + (i + 0.5) / fps)));
   } else {
     if (options.at === undefined) throw new Error('frame requires --at');
-    const at = toMs(parseTime(options.at));
+    const at = toMs(parseTime(options.at[0]));
     if (at >= info.duration) throw new Error('--at must be before the video ends');
     times = [at];
   }

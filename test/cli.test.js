@@ -73,9 +73,26 @@ test('frame accepts --option=value spelling and rejects duplicates across spelli
     const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
     assert.deepEqual([manifest.frames[0].time, manifest.frames[0].file], [7.5, 'frame-0000_00-07.500.jpg']);
     assert.ok(jpegInfo(path.join(output.directory, manifest.frames[0].file)).width <= 160);
-    const duplicate = invoke('frame', video, '--at', '1', '--at=2', '--output', path.join(directory, 'dup'));
+    const duplicate = invoke('frame', video, '--width', '160', '--width=320', '--output', path.join(directory, 'dup'));
     assert.notEqual(duplicate.status, 0);
-    assert.match(duplicate.stderr, /duplicate option: --at\b/);
+    assert.match(duplicate.stderr, /duplicate option: --width\b/);
+  });
+});
+
+test('multi-value --at is parsed but not yet supported, and empty items are rejected', async () => {
+  await withTempDirectory(async (directory) => {
+    const out = path.join(directory, 'out');
+    for (const args of [['--at=1,2'], ['--at', '1,2'], ['--at', '1', '--at', '2']]) {
+      const result = invoke('frame', video, ...args, '--output', out);
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /multiple --at values are not supported yet/);
+    }
+    for (const args of [['--at', ','], ['--at', '3,'], ['--at=1,,2']]) {
+      const result = invoke('frame', video, ...args, '--output', out);
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /empty item in --at/);
+    }
+    assert.deepEqual(await readdir(directory), []);
   });
 });
 
