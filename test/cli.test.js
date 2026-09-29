@@ -318,6 +318,105 @@ test('anamorphic frames and contact sheets use square pixels', async () => {
   });
 });
 
+// Share of pixels that are clearly red (not the blue background) in a decoded image.
+function redShare(file) {
+  const decoded = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-i', file, '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'], { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 });
+  assert.equal(decoded.status, 0, decoded.stderr.toString());
+  let red = 0;
+  for (let i = 0; i < decoded.stdout.length; i += 3) {
+    if (decoded.stdout[i] > 150 && decoded.stdout[i + 2] < 100) red++;
+  }
+  return red / (decoded.stdout.length / 3);
+}
+
+test('crop selects the displayed region at native resolution and sheets tile it', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'quadrant.mp4');
+    ffmpeg('-f', 'lavfi', '-i', 'color=blue:size=1280x720:rate=10:duration=2',
+      '-vf', 'drawbox=x=640:y=0:w=640:h=360:color=red:t=fill', '-c:v', 'mpeg4', '-q:v', '2', '-y', source);
+    const output = success('frame', source, '--at', '1', '--crop=0.5,0,0.5,0.5', '--output', path.join(directory, 'frame'));
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    assert.deepEqual(manifest.crop, { x: 0.5, y: 0, w: 0.5, h: 0.5, pixels: { x: 640, y: 0, width: 640, height: 360, displayed: { width: 640, height: 360 } } });
+    const file = path.join(output.directory, manifest.frames[0].file);
+    const image = jpegInfo(file);
+    assert.deepEqual([image.width, image.height], [640, 360]);
+    assert.ok(redShare(file) > 0.98);
+
+    const overview = success('overview', source, '--frames', '2', '--crop', '0.5,0,0.5,0.5', '--width', '160', '--output', path.join(directory, 'overview'));
+    const sheet = JSON.parse(await readFile(overview.manifest, 'utf8')).sheets[0];
+    assert.ok(Math.abs(sheet.tileWidth / sheet.tileHeight - 16 / 9) < 0.1, `${sheet.tileWidth}x${sheet.tileHeight}`);
+    assert.ok(redShare(overview.sheets[0]) > 0.9);
+  });
+});
+
+test('crop on a rotated source uses the displayed orientation', async () => {
+  await withTempDirectory(async (directory) => {
+    const plain = path.join(directory, 'plain.mp4');
+    const rotated = path.join(directory, 'rotated.mp4');
+    // Red left and right quarters become the top and bottom bands after a 90 degree turn in either direction.
+    ffmpeg('-f', 'lavfi', '-i', 'color=blue:size=320x180:rate=10:duration=2',
+      '-vf', 'drawbox=x=0:y=0:w=80:h=180:color=red:t=fill,drawbox=x=240:y=0:w=80:h=180:color=red:t=fill',
+      '-c:v', 'mpeg4', '-q:v', '2', '-y', plain);
+    ffmpeg('-display_rotation', '90', '-i', plain, '-c', 'copy', '-y', rotated);
+    const output = success('frame', rotated, '--at', '1', '--crop', '0,0,1,0.25', '--output', path.join(directory, 'out'));
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    assert.deepEqual(manifest.crop.pixels, { x: 0, y: 0, width: 180, height: 80, displayed: { width: 180, height: 80 } });
+    const file = path.join(output.directory, manifest.frames[0].file);
+    const image = jpegInfo(file);
+    assert.deepEqual([image.width, image.height], [180, 80]);
+    assert.ok(redShare(file) > 0.95);
+  });
+});
+
+test('crop on anamorphic sources is capped at the displayed crop size with square pixels', async () => {
+  await withTempDirectory(async (directory) => {
+    for (const [sar, displayed] of [['2/1', [320, 90]], ['1/2', [80, 90]]]) {
+      const source = path.join(directory, `sar-${sar.replace('/', '-')}.mp4`);
+      ffmpeg('-f', 'lavfi', '-i', 'color=blue:size=320x180:rate=10:duration=2',
+        '-vf', `drawbox=x=160:y=0:w=160:h=90:color=red:t=fill,setsar=${sar}`, '-c:v', 'mpeg4', '-q:v', '2', '-y', source);
+      const output = success('frame', source, '--at', '1', '--crop=0.5,0,0.5,0.5', '--output', path.join(directory, `out-${sar.replace('/', '-')}`));
+      const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+      assert.deepEqual(manifest.crop.pixels, { x: 160, y: 0, width: 160, height: 90, displayed: { width: displayed[0], height: displayed[1] } });
+      const file = path.join(output.directory, manifest.frames[0].file);
+      const image = jpegInfo(file);
+      assert.equal(image.sample_aspect_ratio, '1:1');
+      assert.ok(image.width <= displayed[0] && image.height <= displayed[1], `${sar}: ${image.width}x${image.height}`);
+      assert.deepEqual([image.width, image.height], displayed);
+      assert.ok(redShare(file) > 0.95);
+    }
+  });
+});
+
+test('inspect frames and sheets use the crop', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'quadrant.mp4');
+    ffmpeg('-f', 'lavfi', '-i', 'color=blue:size=320x180:rate=10:duration=2',
+      '-vf', 'drawbox=x=160:y=0:w=160:h=90:color=red:t=fill', '-c:v', 'mpeg4', '-q:v', '2', '-y', source);
+    const output = success('inspect', source, '--around', '1', '--window', '1s', '--fps', '2', '--crop', '0.5,0,0.5,0.5', '--output', path.join(directory, 'out'));
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    assert.equal(manifest.outputWidth, 160);
+    for (const frame of manifest.frames) {
+      const file = path.join(output.directory, frame.file);
+      assert.deepEqual([jpegInfo(file).width, jpegInfo(file).height], [160, 90]);
+      assert.ok(redShare(file) > 0.95);
+    }
+    assert.ok(redShare(output.sheets[0]) > 0.9);
+  });
+});
+
+test('invalid crops are rejected before any output is created', async () => {
+  await withTempDirectory(async (directory) => {
+    const out = path.join(directory, 'out');
+    for (const [crop, message] of [['0.8,0,0.5,1', /must fit/], ['0,0,0,1', /above 0/], ['0,0,1', /four fractions/],
+      ['0,0,1.5,1', /four fractions/], ['0,0,0.005,1', /at least 16x16/]]) {
+      const result = invoke('frame', video, '--at', '1', '--crop', crop, '--output', out);
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, message);
+    }
+    assert.deepEqual(await readdir(directory), []);
+  });
+});
+
 test('inspect clips near the end and produces decodable JPEGs at the requested source positions', async () => {
   await withTempDirectory(async (directory) => {
     const output = success('inspect', video, '--around', '25.58', '--window', '2s', '--fps', '4', '--output', directory);

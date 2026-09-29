@@ -7,21 +7,23 @@ import { fileURLToPath } from 'node:url';
 const HELP = `agvid <command> <video> [options]
 
 Commands:
-  overview [--frames N] [--start TIME] [--end TIME] [--width PX] [--output DIR] <video>
-  inspect <video> (--around TIME [--window DURATION] | --start TIME [--end TIME]) [--fps N] [--width PX] [--output DIR]
-  frame <video> --at TIME [--width PX] [--output DIR]
+  overview [--frames N] [--start TIME] [--end TIME] [--crop X,Y,W,H] [--width PX] [--output DIR] <video>
+  inspect <video> (--around TIME [--window DURATION] | --start TIME [--end TIME]) [--fps N] [--crop X,Y,W,H] [--width PX] [--output DIR]
+  frame <video> --at TIME [--crop X,Y,W,H] [--width PX] [--output DIR]
   probe <video>...
 
 TIME accepts seconds or HH:MM:SS.s. DURATION accepts seconds, with optional s suffix.
+--crop takes fractions 0-1 of the displayed frame (left, top, width, height) and cuts
+that region at source resolution before --width scaling; it is never enlarged.
 --window is the total duration centered on --around. Options also accept --key=value.
 Writes JPEG frames and manifest.json; overview and inspect also write timecode-labeled
 sheet-NN.jpg. Output defaults to .agvid/runs/ under the git root (else cwd); --output DIR
 must be new or empty. FFmpeg and FFprobe must be available on PATH.`;
 
 const OPTIONS = {
-  overview: new Set(['frames', 'start', 'end', 'width', 'output']),
-  inspect: new Set(['around', 'window', 'fps', 'start', 'end', 'width', 'output']),
-  frame: new Set(['at', 'width', 'output']),
+  overview: new Set(['frames', 'start', 'end', 'crop', 'width', 'output']),
+  inspect: new Set(['around', 'window', 'fps', 'start', 'end', 'crop', 'width', 'output']),
+  frame: new Set(['at', 'crop', 'width', 'output']),
   probe: new Set(),
 };
 
@@ -60,6 +62,29 @@ export function resolveRange(options, info) {
   if (start >= info.duration) throw new Error(`--start ${formatTimecode(start)} must be before the video ends`);
   if (start >= end) throw new Error(`--start ${formatTimecode(start)} must be before --end ${formatTimecode(end)}`);
   return { start, end };
+}
+
+// Parses --crop fractions and maps them to even pixel offsets and sizes in the source's displayed orientation.
+// FFmpeg auto-rotates before -vf. SAR stretches only the displayed horizontal axis, uniformly, so equal fractions
+// of stored pixels still name the displayed region; `displayed` is that region's size in square pixels.
+export function parseCrop(value, info) {
+  const parts = String(value).split(',');
+  const numbers = parts.map((part) => (/^\s*\d*\.?\d+\s*$/.test(part) ? Number(part) : NaN));
+  if (parts.length !== 4 || numbers.some((n) => !Number.isFinite(n) || n < 0 || n > 1)) {
+    throw new Error(`--crop must be four fractions from 0 to 1 (x,y,w,h): ${value}`);
+  }
+  const [x, y, w, h] = numbers;
+  if (w <= 0 || h <= 0) throw new Error(`--crop width and height must be above 0: ${value}`);
+  if (x + w > 1 + 1e-9 || y + h > 1 + 1e-9) throw new Error(`--crop region must fit in the frame (x+w and y+h at most 1): ${value}`);
+  const axis = (start, size, total) => {
+    const offset = Math.floor(start * total / 2) * 2;
+    return [offset, Math.min(Math.round(size * total / 2) * 2, Math.floor((total - offset) / 2) * 2)];
+  };
+  const [px, width] = axis(x, w, info.width);
+  const [py, height] = axis(y, h, info.height);
+  if (width < 16 || height < 16) throw new Error(`--crop region is ${width}x${height} source pixels; it must be at least 16x16`);
+  const displayed = { width: Math.max(2, Math.round(width * (info.sar ?? 1))), height };
+  return { x, y, w, h, pixels: { x: px, y: py, width, height, displayed } };
 }
 
 function parseArgs(args) {
@@ -109,7 +134,7 @@ function run(program, args) {
 
 async function probe(video) {
   // No -select_streams: the full listing also reveals audio. The first video stream matches FFmpeg's 0:v:0.
-  const raw = await run('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,width,height,avg_frame_rate,codec_name,duration,nb_frames,pix_fmt,bits_per_raw_sample:stream_side_data=rotation:stream_tags=DURATION,rotate', '-of', 'json', video]);
+  const raw = await run('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,width,height,avg_frame_rate,codec_name,duration,nb_frames,pix_fmt,bits_per_raw_sample,sample_aspect_ratio:stream_side_data=rotation:stream_tags=DURATION,rotate', '-of', 'json', video]);
   const streams = JSON.parse(raw).streams ?? [];
   const stream = streams.find((entry) => entry.codec_type === 'video');
   if (!stream) throw new Error('no video stream found');
@@ -141,8 +166,12 @@ async function probe(video) {
   const frameCountEstimated = !(Number.isInteger(counted) && counted > 0);
   const frameCount = frameCountEstimated ? (fps === null ? null : Math.round(duration * rate)) : counted;
   const bitDepth = Number(stream.bits_per_raw_sample);
+  // SAR stretches stored pixels horizontally; after a 90/270 turn it applies to the displayed vertical axis, so invert it.
+  const [sarNum, sarDen] = String(stream.sample_aspect_ratio ?? '').split(':').map(Number);
+  const storedSar = sarNum > 0 && sarDen > 0 ? sarNum / sarDen : 1;
+  const sar = swap ? 1 / storedSar : storedSar;
   return { video, duration, width: swap ? stream.height : stream.width, height: swap ? stream.width : stream.height,
-    rotation, codedWidth: stream.width, codedHeight: stream.height, fps, frameRate: stream.avg_frame_rate ?? null,
+    sar, rotation, codedWidth: stream.width, codedHeight: stream.height, fps, frameRate: stream.avg_frame_rate ?? null,
     frameCount, frameCountEstimated, codec: stream.codec_name, pixelFormat: stream.pix_fmt ?? null,
     bitDepth: Number.isInteger(bitDepth) && bitDepth > 0 ? bitDepth : null,
     hasAudio: streams.some((entry) => entry.codec_type === 'audio'), durationSource };
@@ -213,8 +242,9 @@ async function outputDirectory(video, command, requested) {
   }
 }
 
-async function extract(video, time, width, filename) {
-  await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-ss', String(time), '-i', video, '-map', '0:v:0', '-frames:v', '1', '-vf', `scale=${width}:max(2\\,round(${width}/dar/2)*2),setsar=1`, '-threads:v', '1', '-q:v', '4', '-y', filename]);
+async function extract(video, time, width, filename, crop) {
+  const cut = crop ? `crop=${crop.pixels.width}:${crop.pixels.height}:${crop.pixels.x}:${crop.pixels.y},` : '';
+  await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-ss', String(time), '-i', video, '-map', '0:v:0', '-frames:v', '1', '-vf', `${cut}scale=${width}:max(2\\,round(${width}/dar/2)*2),setsar=1`, '-threads:v', '1', '-q:v', '4', '-y', filename]);
 }
 
 async function nonempty(filename) {
@@ -365,7 +395,8 @@ export async function main(args) {
     return;
   }
   const info = await probe(video);
-  const width = Math.min(info.width, numberOption(options.width ?? 640, 'width', 64, 4096, true));
+  const crop = options.crop === undefined ? undefined : parseCrop(options.crop, info);
+  const width = Math.min(crop?.pixels.displayed.width ?? info.width, numberOption(options.width ?? 640, 'width', 64, 4096, true));
   let times;
   let windows;
   let range;
@@ -417,11 +448,11 @@ export async function main(args) {
     const target = path.join(directory, filename);
     produced.push(target);
     let extractionError;
-    try { await extract(video, time, width, target); }
+    try { await extract(video, time, width, target, crop); }
     catch (error) { extractionError = error; }
     if (extractionError && await nonempty(target)) throw extractionError;
     if (!(await nonempty(target)) && info.duration - time < 0.1) {
-      await extract(video, Math.max(0, info.duration - 0.1), width, target);
+      await extract(video, Math.max(0, info.duration - 0.1), width, target, crop);
     }
     if (!(await nonempty(target))) throw extractionError ?? new Error(`FFmpeg produced no frame for ${time}s`);
     return { file: filename, time, timecode };
@@ -449,7 +480,7 @@ export async function main(args) {
       }
     }
     produced.push(path.join(directory, 'manifest.json.tmp'), path.join(directory, 'manifest.json'));
-    const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, ...(range && (options.start !== undefined || options.end !== undefined) ? { range: { start: toMs(range.start), end: toMs(range.end) } } : {}), frames, ...(windows ? { windows } : {}), ...(sheets ? { sheets } : {}) });
+    const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, ...(crop ? { crop } : {}), ...(range && (options.start !== undefined || options.end !== undefined) ? { range: { start: toMs(range.start), end: toMs(range.end) } } : {}), frames, ...(windows ? { windows } : {}), ...(sheets ? { sheets } : {}) });
     console.log(JSON.stringify({ directory, ...(sheets ? { sheets: sheets.map((sheet) => path.join(directory, sheet.file)) } : {}), manifest, frames: frames.length }, null, 2));
   } catch (error) {
     if (created) {
