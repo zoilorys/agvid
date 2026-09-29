@@ -79,19 +79,40 @@ test('frame accepts --option=value spelling and rejects duplicates across spelli
   });
 });
 
-test('multi-value --at is parsed but not yet supported, and empty items are rejected', async () => {
+test('empty items in multi-value options are rejected', async () => {
   await withTempDirectory(async (directory) => {
     const out = path.join(directory, 'out');
-    for (const args of [['--at=1,2'], ['--at', '1,2'], ['--at', '1', '--at', '2']]) {
-      const result = invoke('frame', video, ...args, '--output', out);
-      assert.notEqual(result.status, 0);
-      assert.match(result.stderr, /multiple --at values are not supported yet/);
-    }
+    const around = invoke('inspect', video, '--around', '1,2', '--output', out);
+    assert.notEqual(around.status, 0);
+    assert.match(around.stderr, /multiple --around values are not supported yet/);
     for (const args of [['--at', ','], ['--at', '3,'], ['--at=1,,2']]) {
       const result = invoke('frame', video, ...args, '--output', out);
       assert.notEqual(result.status, 0);
       assert.match(result.stderr, /empty item in --at/);
     }
+    assert.deepEqual(await readdir(directory), []);
+  });
+});
+
+test('batched frame times are sorted, deduped and sheeted', async () => {
+  await withTempDirectory(async (directory) => {
+    const output = success('frame', video, '--at=12,3', '--at', '7.5,00:07.5', '--width', '160', '--output', directory);
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    assert.deepEqual(manifest.frames.map((frame) => [frame.file, frame.time]), [
+      ['frame-0000_00-03.000.jpg', 3], ['frame-0001_00-07.500.jpg', 7.5], ['frame-0002_00-12.000.jpg', 12]]);
+    assert.equal(output.frames, 3);
+    assert.deepEqual(manifest.sheets.map((sheet) => [sheet.file, ...sheet.frames]), [['sheet-01.jpg', 0, 2]]);
+    jpegInfo(output.sheets[0]);
+    for (const frame of manifest.frames) jpegInfo(path.join(directory, frame.file));
+  });
+});
+
+test('batched frame with an out-of-range time fails before creating output', async () => {
+  await withTempDirectory(async (directory) => {
+    const out = path.join(directory, 'out');
+    const result = invoke('frame', video, '--at', '3,99', '--output', out);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--at 99 must be before the video ends/);
     assert.deepEqual(await readdir(directory), []);
   });
 });

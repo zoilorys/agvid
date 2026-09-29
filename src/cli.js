@@ -338,9 +338,7 @@ export async function main(args) {
     return;
   }
   const { command, video, options } = parseArgs(args);
-  for (const key of MULTI) {
-    if (options[key]?.length > 1) throw new Error(`multiple --${key} values are not supported yet`);
-  }
+  if (options.around?.length > 1) throw new Error('multiple --around values are not supported yet');
   const info = await probe(video);
   if (command === 'probe') {
     console.log(JSON.stringify(info, null, 2));
@@ -366,9 +364,12 @@ export async function main(args) {
     times = Array.from({ length: count }, (_, i) => toMs(Math.min(end - 0.001, start + (i + 0.5) / fps)));
   } else {
     if (options.at === undefined) throw new Error('frame requires --at');
-    const at = toMs(parseTime(options.at[0]));
-    if (at >= info.duration) throw new Error('--at must be before the video ends');
-    times = [at];
+    times = [...new Set(options.at.map((value) => {
+      const time = toMs(parseTime(value));
+      if (time >= info.duration) throw new Error(`--at ${value} must be before the video ends`);
+      return time;
+    }))].sort((a, b) => a - b);
+    if (times.length > 240) throw new Error('frame would create over 240 frames; reduce --at values');
   }
   const { directory, created, firstParent } = await outputDirectory(video, command, options.output);
   const frames = [];
@@ -391,7 +392,7 @@ export async function main(args) {
   try {
     frames.push(...await pool(times, Math.min(os.availableParallelism(), 8), extractFrame));
     let sheets;
-    if (command !== 'frame') {
+    if (command !== 'frame' || frames.length > 1) {
       const size = await frameSize(path.join(directory, frames[0].file));
       sheets = [];
       for (const [i, { first, last, layout }] of planSheets(frames.length, size.width, size.height).entries()) {
