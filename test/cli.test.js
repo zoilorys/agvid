@@ -821,3 +821,27 @@ test('an excessive extraction request fails before creating its output directory
     assert.deepEqual(await readdir(directory), []);
   });
 });
+
+test('changes rejects FFmpeg older than 5.1 before creating output, and accepts 5.1', async () => {
+  await withTempDirectory(async (directory) => {
+    const bin = path.join(directory, 'bin');
+    await mkdir(bin);
+    const shim = path.join(bin, 'ffmpeg');
+    const realFfmpeg = spawnSync('which', ['ffmpeg'], { encoding: 'utf8' }).stdout.trim();
+    const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` };
+    const versioned = (version) => writeFile(shim, `#!/bin/sh\nif [ "$1" = "-version" ]; then echo "ffmpeg version ${version} Copyright"; exit 0; fi\nexec ${realFfmpeg} "$@"\n`);
+    await chmod(bin, 0o755);
+    for (const version of ['4.4.2', 'n5.0.3', '3.4']) {
+      await versioned(version);
+      await chmod(shim, 0o755);
+      const result = invokeIn({ cwd: directory, env }, 'changes', video, '--output', path.join(directory, 'out'));
+      assert.notEqual(result.status, 0, version);
+      assert.match(result.stderr, /changes needs FFmpeg 5\.1 or newer/);
+    }
+    assert.deepEqual((await readdir(directory)).sort(), ['bin']);
+    await versioned('5.1.2');
+    await chmod(shim, 0o755);
+    const ok = invokeIn({ cwd: directory, env }, 'changes', video, '--end', '3', '--output', path.join(directory, 'out'));
+    assert.equal(ok.status, 0, ok.stderr);
+  });
+});

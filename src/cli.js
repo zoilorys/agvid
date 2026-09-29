@@ -268,6 +268,15 @@ const PIXEL_DELTA = 16;
 // (initially the first decoded one, at the range start). Times are source pts from showinfo, which -ss input seeking
 // makes relative to the range start. Streams rawvideo; keeps only the
 // reference frame and frames still waiting for their pts line.
+// changes uses -fps_mode (FFmpeg 5.1+). Unparseable versions, such as git builds, are let through.
+async function requireFfmpeg51() {
+  const first = (await run('ffmpeg', ['-version'])).split('\n')[0];
+  const match = /^ffmpeg version n?(\d+)\.(\d+)/.exec(first);
+  if (match && (Number(match[1]) < 5 || (Number(match[1]) === 5 && Number(match[2]) < 1))) {
+    throw new Error(`changes needs FFmpeg 5.1 or newer, found ${match[1]}.${match[2]}; upgrade FFmpeg or use overview/inspect instead`);
+  }
+}
+
 function detectChanges(video, info, range, crop, { threshold, minGap }) {
   const sourceWidth = crop?.pixels.width ?? info.width;
   const sourceHeight = crop?.pixels.height ?? info.height;
@@ -544,6 +553,7 @@ export async function main(args) {
     const minGap = numberOption(parseTime(options['min-gap'] ?? '0.5'), 'min-gap', 0, 3600);
     const max = numberOption(options.max ?? 48, 'max', 1, 240, true);
     range = resolveRange(options, info);
+    await requireFfmpeg51();
     const found = await detectChanges(video, info, range, crop, { threshold, minGap });
     const truncated = found.length > max;
     const kept = truncated ? [...found].sort((a, b) => b.score - a.score || a.time - b.time).slice(0, max).sort((a, b) => a.time - b.time) : found;
