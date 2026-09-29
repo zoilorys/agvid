@@ -65,6 +65,29 @@ test('probe reports the real fixture and frame extracts a bounded JPEG at its re
   });
 });
 
+test('probe of several videos keeps argument order and reports failures inline', async () => {
+  await withTempDirectory(async (directory) => {
+    const clip = path.join(directory, 'clip.mp4');
+    ffmpeg('-f', 'lavfi', '-i', 'testsrc=size=64x48:rate=10:duration=1', '-pix_fmt', 'yuv420p', clip);
+    const both = success('probe', video, clip);
+    assert.deepEqual(both.map((entry) => entry.video), [video, clip]);
+    assert.equal(both[1].width, 64);
+
+    const missing = path.join(directory, 'missing.mov');
+    const result = invoke('probe', video, missing, clip);
+    assert.equal(result.status, 1);
+    const entries = JSON.parse(result.stdout);
+    assert.equal(entries.length, 3);
+    assert.equal(entries[0].video, video);
+    assert.ok(entries[0].duration > 25);
+    assert.deepEqual(Object.keys(entries[1]), ['video', 'error']);
+    assert.equal(entries[1].video, missing);
+    assert.equal(entries[2].video, clip);
+
+    assert.notEqual(invoke('frame', video, clip, '--at', '1').status, 0);
+  });
+});
+
 test('frame accepts --option=value spelling and rejects duplicates across spellings', async () => {
   await withTempDirectory(async (directory) => {
     // A sub-millisecond request rounds to the millisecond the filename names.

@@ -10,7 +10,7 @@ Commands:
   overview [--frames N] [--width PX] [--output DIR] <video>
   inspect <video> --around TIME [--window DURATION] [--fps N] [--width PX] [--output DIR]
   frame <video> --at TIME [--width PX] [--output DIR]
-  probe <video>
+  probe <video>...
 
 TIME accepts seconds or HH:MM:SS.s. DURATION accepts seconds, with optional s suffix.
 --window is the total duration centered on --around. Options also accept --key=value.
@@ -58,6 +58,7 @@ function parseArgs(args) {
   if (!OPTIONS[command]) throw new Error(`unknown command: ${command ?? ''}\n\n${HELP}`);
   const options = {};
   let video;
+  const videos = [];
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
     if (arg.startsWith('--')) {
@@ -73,8 +74,13 @@ function parseArgs(args) {
         if (items.some((item) => !item)) throw new Error(`empty item in ${name}: ${value}`);
         (options[key] ??= []).push(...items);
       } else options[key] = value;
-    } else if (!video) video = arg;
+    } else if (command === 'probe') videos.push(arg);
+    else if (!video) video = arg;
     else throw new Error(`unexpected argument: ${arg}`);
+  }
+  if (command === 'probe') {
+    if (!videos.length) throw new Error(`missing video path\n\n${HELP}`);
+    return { command, videos: videos.map((file) => path.resolve(file)), options };
   }
   if (!video) throw new Error(`missing video path\n\n${HELP}`);
   return { command, video: path.resolve(video), options };
@@ -337,12 +343,19 @@ export async function main(args) {
     console.log(pkg.version);
     return;
   }
-  const { command, video, options } = parseArgs(args);
-  const info = await probe(video);
+  const { command, video, videos, options } = parseArgs(args);
   if (command === 'probe') {
-    console.log(JSON.stringify(info, null, 2));
+    if (videos.length === 1) {
+      console.log(JSON.stringify(await probe(videos[0]), null, 2));
+      return;
+    }
+    const results = await pool(videos, Math.min(os.availableParallelism(), 8),
+      (file) => probe(file).catch((error) => ({ video: file, error: error.message })));
+    if (results.some((entry) => 'error' in entry)) process.exitCode = 1;
+    console.log(JSON.stringify(results, null, 2));
     return;
   }
+  const info = await probe(video);
   const width = Math.min(info.width, numberOption(options.width ?? 640, 'width', 64, 4096, true));
   let times;
   let windows;
