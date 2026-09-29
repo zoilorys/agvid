@@ -8,21 +8,28 @@ const HELP = `agvid <command> <video> [options]
 
 Commands:
   overview [--frames N] [--start TIME] [--end TIME] [--crop X,Y,W,H] [--width PX] [--output DIR] <video>
-  inspect <video> (--around TIME [--window DURATION] | --start TIME [--end TIME]) [--fps N] [--crop X,Y,W,H] [--width PX] [--output DIR]
-  frame <video> --at TIME [--crop X,Y,W,H] [--width PX] [--output DIR]
+  inspect <video> (--around TIME [--window DURATION] | [--start TIME] [--end TIME]) [--fps N] [--crop X,Y,W,H] [--width PX] [--output DIR]
+  frame <video> --at TIME[,TIME...] [--crop X,Y,W,H] [--width PX] [--output DIR]
   changes <video> [--start TIME] [--end TIME] [--crop X,Y,W,H] [--threshold X] [--min-gap DURATION] [--max N] [--width PX] [--output DIR]
   probe <video>...
 
+--at and --around take comma lists or repeat the flag. --at times are deduped and sorted;
+each --around gets its own window and sheets (manifest windows[]). Up to 240 frames.
 changes writes the range start plus each frame where over --threshold (default 0.002) of the
-picture differs from the last reported frame, at least --min-gap (default 0.5s) apart; --max
-(default 48, up to 240) keeps the highest scores. --crop limits detection to the region.
+picture differs from the last detected candidate, at least --min-gap (default 0.5s) apart;
+--max (default 48, up to 240) keeps the highest scores. It decodes the whole range (sampled
+up to 10 fps): use --start/--end on long videos. Needs FFmpeg 5.1+. --crop limits detection
+to the region; use it for small UI changes.
 TIME accepts seconds or HH:MM:SS.s. DURATION accepts seconds, with optional s suffix.
+--end is clamped to the video duration. --start/--end cannot combine with --around/--window.
 --crop takes fractions 0-1 of the displayed frame (left, top, width, height) and cuts
 that region at source resolution before --width scaling; it is never enlarged.
 --window is the total duration centered on --around. Options also accept --key=value.
-Writes JPEG frames and manifest.json; overview and inspect also write timecode-labeled
-sheet-NN.jpg (changes too). Output defaults to .agvid/runs/ under the git root (else cwd); --output DIR
-must be new or empty. FFmpeg and FFprobe must be available on PATH.`;
+Writes JPEG frames and manifest.json; overview, inspect and changes also write
+timecode-labeled sheet-NN.jpg. Output defaults to .agvid/runs/ under the git root (else cwd);
+--output DIR must be new or empty. probe with several videos prints an array, with
+{video,error} entries for failures, and exits 1 if any failed.
+FFmpeg and FFprobe must be available on PATH.`;
 
 const OPTIONS = {
   overview: new Set(['frames', 'start', 'end', 'crop', 'width', 'output']),
