@@ -8,7 +8,7 @@ const HELP = `agvid <command> <video> [options]
 
 Commands:
   overview [--frames N] [--start TIME] [--end TIME] [--width PX] [--output DIR] <video>
-  inspect <video> --around TIME [--window DURATION] [--fps N] [--width PX] [--output DIR]
+  inspect <video> (--around TIME [--window DURATION] | --start TIME [--end TIME]) [--fps N] [--width PX] [--output DIR]
   frame <video> --at TIME [--width PX] [--output DIR]
   probe <video>...
 
@@ -20,7 +20,7 @@ must be new or empty. FFmpeg and FFprobe must be available on PATH.`;
 
 const OPTIONS = {
   overview: new Set(['frames', 'start', 'end', 'width', 'output']),
-  inspect: new Set(['around', 'window', 'fps', 'width', 'output']),
+  inspect: new Set(['around', 'window', 'fps', 'start', 'end', 'width', 'output']),
   frame: new Set(['at', 'width', 'output']),
   probe: new Set(),
 };
@@ -374,16 +374,23 @@ export async function main(args) {
     const { start, end } = range = resolveRange(options, info);
     times = Array.from({ length: count }, (_, i) => toMs(start + (end - start) * (i + 0.5) / count));
   } else if (command === 'inspect') {
-    if (options.around === undefined) throw new Error('inspect requires --around');
-    const arounds = [...new Set(options.around.map((value) => toMs(parseTime(value))))].sort((a, b) => a - b);
-    const window = numberOption(parseTime(options.window ?? '2s'), 'window', 0.001, 3600);
+    const ranged = options.start !== undefined || options.end !== undefined;
+    if (ranged && (options.around !== undefined || options.window !== undefined)) throw new Error('--start/--end cannot be combined with --around/--window');
+    if (!ranged && options.around === undefined) throw new Error('inspect requires --around or --start/--end');
     const fps = numberOption(options.fps ?? 4, 'fps', 0.1, 60);
+    let spans;
+    if (ranged) spans = [{ around: null, ...resolveRange(options, info) }];
+    else {
+      const arounds = [...new Set(options.around.map((value) => toMs(parseTime(value))))].sort((a, b) => a - b);
+      const window = numberOption(parseTime(options.window ?? '2s'), 'window', 0.001, 3600);
+      spans = arounds.map((around) => {
+        if (around > info.duration) throw new Error(`--around ${formatTimecode(around)} is beyond the video duration`);
+        return { around, start: Math.max(0, around - window / 2), end: Math.min(info.duration, around + window / 2) };
+      });
+    }
     times = [];
     windows = [];
-    for (const around of arounds) {
-      if (around > info.duration) throw new Error(`--around ${formatTimecode(around)} is beyond the video duration`);
-      const start = Math.max(0, around - window / 2);
-      const end = Math.min(info.duration, around + window / 2);
+    for (const { around, start, end } of spans) {
       const count = Math.ceil((end - start) * fps);
       if (count < 1) throw new Error('inspect window contains no frames');
       if (times.length + count > 240) throw new Error('inspect would create over 240 frames; reduce --window, --fps or --around values');

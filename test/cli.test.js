@@ -382,6 +382,33 @@ test('overview samples only the requested section and rejects bad ranges before 
   });
 });
 
+test('inspect by explicit range samples one window and rejects mixing with --around', async () => {
+  await withTempDirectory(async (directory) => {
+    const output = success('inspect', video, '--start=3', '--end', '5', '--fps', '4', '--width', '160', '--output', path.join(directory, 'ok'));
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    assert.equal(manifest.frames.length, 8);
+    assert.ok(manifest.frames.every((frame) => frame.time >= 3 && frame.time < 5));
+    assert.equal(manifest.windows.length, 1);
+    const [window] = manifest.windows;
+    assert.deepEqual([window.around, window.start, window.end, ...window.frames], [null, 3, 5, 0, 7]);
+    assert.equal(window.sheets.length, 1);
+
+    const open = success('inspect', video, '--start', '25', '--fps', '2', '--width', '160', '--output', path.join(directory, 'open'));
+    const openManifest = JSON.parse(await readFile(open.manifest, 'utf8'));
+    assert.equal(openManifest.windows[0].start, 25);
+    assert.ok(Math.abs(openManifest.windows[0].end - openManifest.source.duration) < 0.001);
+
+    for (const args of [['--start', '3', '--around', '4'], ['--end', '5', '--window', '1s']]) {
+      const bad = invoke('inspect', video, ...args, '--output', path.join(directory, 'bad'));
+      assert.notEqual(bad.status, 0);
+      assert.match(bad.stderr, /cannot be combined/);
+    }
+    const none = invoke('inspect', video, '--output', path.join(directory, 'bad'));
+    assert.match(none.stderr, /requires --around or --start\/--end/);
+    assert.deepEqual((await readdir(directory)).sort(), ['ok', 'open']);
+  });
+});
+
 test('sheet tiles of a black clip are bright only in their bottom-left label boxes', async () => {
   await withTempDirectory(async (directory) => {
     const source = path.join(directory, 'black.mp4');
