@@ -338,7 +338,6 @@ export async function main(args) {
     return;
   }
   const { command, video, options } = parseArgs(args);
-  if (options.around?.length > 1) throw new Error('multiple --around values are not supported yet');
   const info = await probe(video);
   if (command === 'probe') {
     console.log(JSON.stringify(info, null, 2));
@@ -346,22 +345,29 @@ export async function main(args) {
   }
   const width = Math.min(info.width, numberOption(options.width ?? 640, 'width', 64, 4096, true));
   let times;
+  let windows;
   if (command === 'overview') {
     const count = numberOption(options.frames ?? 12, 'frames', 1, 64, true);
     times = Array.from({ length: count }, (_, i) => toMs(info.duration * (i + 0.5) / count));
   } else if (command === 'inspect') {
     if (options.around === undefined) throw new Error('inspect requires --around');
-    const around = parseTime(options.around[0]);
+    const arounds = [...new Set(options.around.map((value) => toMs(parseTime(value))))].sort((a, b) => a - b);
     const window = numberOption(parseTime(options.window ?? '2s'), 'window', 0.001, 3600);
     const fps = numberOption(options.fps ?? 4, 'fps', 0.1, 60);
-    if (around > info.duration) throw new Error('--around is beyond the video duration');
-    const start = Math.max(0, around - window / 2);
-    const end = Math.min(info.duration, around + window / 2);
-    const count = Math.ceil((end - start) * fps);
-    if (count < 1) throw new Error('inspect window contains no frames');
-    if (count > 240) throw new Error('inspect would create over 240 frames; reduce --window or --fps');
-    // Rounding moves a time by at most 0.5 ms, so times stay ordered and below end.
-    times = Array.from({ length: count }, (_, i) => toMs(Math.min(end - 0.001, start + (i + 0.5) / fps)));
+    times = [];
+    windows = [];
+    for (const around of arounds) {
+      if (around > info.duration) throw new Error(`--around ${formatTimecode(around)} is beyond the video duration`);
+      const start = Math.max(0, around - window / 2);
+      const end = Math.min(info.duration, around + window / 2);
+      const count = Math.ceil((end - start) * fps);
+      if (count < 1) throw new Error('inspect window contains no frames');
+      if (times.length + count > 240) throw new Error('inspect would create over 240 frames; reduce --window, --fps or --around values');
+      const first = times.length;
+      // Rounding moves a time by at most 0.5 ms, so times stay ordered and below end.
+      for (let i = 0; i < count; i++) times.push(toMs(Math.min(end - 0.001, start + (i + 0.5) / fps)));
+      windows.push({ around, start: toMs(start), end: toMs(end), frames: [first, times.length - 1] });
+    }
   } else {
     if (options.at === undefined) throw new Error('frame requires --at');
     times = [...new Set(options.at.map((value) => {
@@ -395,15 +401,24 @@ export async function main(args) {
     if (command !== 'frame' || frames.length > 1) {
       const size = await frameSize(path.join(directory, frames[0].file));
       sheets = [];
-      for (const [i, { first, last, layout }] of planSheets(frames.length, size.width, size.height).entries()) {
-        const file = `sheet-${String(i + 1).padStart(2, '0')}.jpg`;
+      const slices = windows ?? [{ frames: [0, frames.length - 1] }];
+      const plans = slices.map((slice) => {
+        const offset = slice.frames[0];
+        return planSheets(slice.frames[1] - offset + 1, size.width, size.height)
+          .map(({ first, last, layout }) => ({ slice, first: offset + first, last: offset + last, layout }));
+      }).flat();
+      // Pad to the total so lexical filename order equals manifest order.
+      const digits = Math.max(2, String(plans.length).length);
+      for (const [i, { slice, first, last, layout }] of plans.entries()) {
+        const file = `sheet-${String(i + 1).padStart(digits, '0')}.jpg`;
         produced.push(path.join(directory, file));
         await writeSheet(directory, frames.slice(first, last + 1), file, layout, produced);
         sheets.push({ file, frames: [first, last], start: frames[first].time, end: frames[last].time, ...layout });
+        (slice.sheets ??= []).push(file);
       }
     }
     produced.push(path.join(directory, 'manifest.json.tmp'), path.join(directory, 'manifest.json'));
-    const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, frames, ...(sheets ? { sheets } : {}) });
+    const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, frames, ...(windows ? { windows } : {}), ...(sheets ? { sheets } : {}) });
     console.log(JSON.stringify({ directory, ...(sheets ? { sheets: sheets.map((sheet) => path.join(directory, sheet.file)) } : {}), manifest, frames: frames.length }, null, 2));
   } catch (error) {
     if (created) {

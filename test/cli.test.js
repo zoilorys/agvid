@@ -82,13 +82,10 @@ test('frame accepts --option=value spelling and rejects duplicates across spelli
 test('empty items in multi-value options are rejected', async () => {
   await withTempDirectory(async (directory) => {
     const out = path.join(directory, 'out');
-    const around = invoke('inspect', video, '--around', '1,2', '--output', out);
-    assert.notEqual(around.status, 0);
-    assert.match(around.stderr, /multiple --around values are not supported yet/);
-    for (const args of [['--at', ','], ['--at', '3,'], ['--at=1,,2']]) {
-      const result = invoke('frame', video, ...args, '--output', out);
+    for (const [command, args] of [['frame', ['--at', ',']], ['frame', ['--at', '3,']], ['frame', ['--at=1,,2']], ['inspect', ['--around', '1,']]]) {
+      const result = invoke(command, video, ...args, '--output', out);
       assert.notEqual(result.status, 0);
-      assert.match(result.stderr, /empty item in --at/);
+      assert.match(result.stderr, new RegExp(`empty item in --${command === 'frame' ? 'at' : 'around'}`));
     }
     assert.deepEqual(await readdir(directory), []);
   });
@@ -104,6 +101,74 @@ test('batched frame times are sorted, deduped and sheeted', async () => {
     assert.deepEqual(manifest.sheets.map((sheet) => [sheet.file, ...sheet.frames]), [['sheet-01.jpg', 0, 2]]);
     jpegInfo(output.sheets[0]);
     for (const frame of manifest.frames) jpegInfo(path.join(directory, frame.file));
+  });
+});
+
+test('batched inspect groups frames and sheets per window', async () => {
+  await withTempDirectory(async (directory) => {
+    const output = success('inspect', video, '--around=12', '--around', '3,12', '--window', '1s', '--fps', '4', '--width', '160', '--output', directory);
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    assert.equal(manifest.frames.length, 8);
+    assert.deepEqual(manifest.frames.map((frame) => frame.file.slice(0, 10)), Array.from({ length: 8 }, (_, i) => `frame-000${i}`));
+    assert.deepEqual(manifest.windows.map((w) => [w.around, w.start, w.end, ...w.frames]), [[3, 2.5, 3.5, 0, 3], [12, 11.5, 12.5, 4, 7]]);
+    for (const w of manifest.windows) {
+      const times = manifest.frames.slice(w.frames[0], w.frames[1] + 1).map((frame) => frame.time);
+      assert.ok(times.every((time, i) => time >= w.start && time <= w.end && (i === 0 || time > times[i - 1])));
+      assert.equal(w.sheets.length, 1);
+    }
+    assert.deepEqual(manifest.windows.flatMap((w) => w.sheets), manifest.sheets.map((sheet) => sheet.file));
+    assert.deepEqual(manifest.sheets.map((sheet) => [sheet.file, ...sheet.frames]), [['sheet-01.jpg', 0, 3], ['sheet-02.jpg', 4, 7]]);
+    assert.deepEqual(output.sheets, manifest.sheets.map((sheet) => path.join(directory, sheet.file)));
+    for (const file of output.sheets) jpegInfo(file);
+  });
+});
+
+test('overlapping windows stay separate', async () => {
+  await withTempDirectory(async (directory) => {
+    const output = success('inspect', video, '--around', '5,5.5', '--window', '2s', '--fps', '2', '--width', '160', '--output', directory);
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    assert.deepEqual(manifest.windows.map((w) => w.frames), [[0, 3], [4, 7]]);
+    assert.equal(manifest.frames.length, 8);
+    assert.equal(new Set(manifest.frames.map((frame) => frame.file)).size, 8);
+  });
+});
+
+test('single inspect has one window; an out-of-range --around in a batch fails without output', async () => {
+  await withTempDirectory(async (directory) => {
+    const output = success('inspect', video, '--around', '5.0004', '--width', '160', '--output', path.join(directory, 'one'));
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    assert.deepEqual(manifest.windows.map((w) => [w.around, ...w.frames]), [[5, 0, manifest.frames.length - 1]]);
+    const out = path.join(directory, 'bad');
+    const result = invoke('inspect', video, '--around', '3,99', '--output', out);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /--around 01:39\.000 is beyond/);
+    assert.deepEqual((await readdir(directory)).sort(), ['one']);
+  });
+});
+
+test('100+ one-frame windows keep sheet filenames in manifest order', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'clip.mp4');
+    ffmpeg('-f', 'lavfi', '-i', 'testsrc2=size=64x36:rate=10:duration=30', '-c:v', 'mpeg4', '-y', source);
+    const arounds = Array.from({ length: 105 }, (_, i) => (0.5 + i * 0.25).toFixed(2));
+    const out = path.join(directory, 'out');
+    const output = success('inspect', source, `--around=${arounds.join(',')}`, '--window', '0.09', '--fps', '10', '--output', out);
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    assert.equal(manifest.windows.length, 105);
+    assert.equal(manifest.sheets.length, 105);
+    assert.equal(manifest.sheets[0].file, 'sheet-001.jpg');
+    const onDisk = (await readdir(out)).filter((file) => file.startsWith('sheet-')).sort();
+    assert.deepEqual(onDisk, manifest.sheets.map((sheet) => sheet.file));
+  });
+});
+
+test('batched inspect over the frame cap fails before creating output', async () => {
+  await withTempDirectory(async (directory) => {
+    const out = path.join(directory, 'out');
+    const result = invoke('inspect', video, '--around', '3,12', '--window', '20s', '--fps', '9', '--output', out);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /over 240 frames/);
+    assert.deepEqual(await readdir(directory), []);
   });
 });
 
