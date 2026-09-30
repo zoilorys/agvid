@@ -253,21 +253,21 @@ test('timecodes gain an hour field and carry into it', () => {
   assert.equal(formatTimecode(3661.5), '1:01:01.500');
 });
 
-test('a streamed WebM without duration metadata uses packet timestamps', async () => {
+test('a long streamed WebM without duration metadata uses packet timestamps', async () => {
   await withTempDirectory(async (directory) => {
     const source = path.join(directory, 'no-duration.webm');
-    const result = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=160x90:rate=10:duration=2',
+    const result = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=64x36:rate=30:duration=90',
       '-c:v', 'libvpx', '-f', 'webm', '-'], { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 });
     assert.equal(result.status, 0, result.stderr.toString());
     await writeFile(source, result.stdout);
     const info = success('probe', source);
     assert.equal(info.durationSource, 'packets');
-    assert.ok(info.duration >= 1.95 && info.duration <= 2.05, String(info.duration));
-    assert.deepEqual([info.fps, info.frameCount, info.frameCountEstimated], [10, 20, true]);
+    assert.ok(info.duration >= 89.95 && info.duration <= 90.05, String(info.duration));
+    assert.deepEqual([info.fps, info.frameCount, info.frameCountEstimated], [30, 2700, true]);
     const output = success('overview', source, '--frames', '3', '--output', path.join(directory, 'out'));
     const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
     assert.equal(manifest.frames.length, 3);
-    assert.ok(manifest.frames.every((frame) => frame.time < 2));
+    assert.ok(manifest.frames.every((frame) => frame.time < 90));
     for (const frame of manifest.frames) jpegInfo(path.join(output.directory, frame.file));
   });
 });
