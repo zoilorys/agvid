@@ -194,16 +194,31 @@ async function probe(video) {
 }
 
 async function packetDuration(video) {
-  const raw = await run('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'packet=pts_time,duration_time', '-of', 'csv=p=0', video]);
-  let start = Infinity;
-  let end = -Infinity;
-  for (const line of raw.split('\n')) {
-    const [pts, length] = line.split(',').map((field) => (/^-?\d+(?:\.\d+)?$/.test(field?.trim() ?? '') ? Number(field) : NaN));
-    if (!Number.isFinite(pts) || !Number.isFinite(length)) continue;
-    start = Math.min(start, pts);
-    end = Math.max(end, pts + length);
-  }
-  return end - start;
+  return new Promise((resolve, reject) => {
+    const child = spawn('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'packet=pts_time,duration_time', '-of', 'csv=p=0', video], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let start = Infinity;
+    let end = -Infinity;
+    let pending = '';
+    let stderr = '';
+    const consume = (line) => {
+      const [pts, length] = line.split(',').map((field) => (/^-?\d+(?:\.\d+)?$/.test(field?.trim() ?? '') ? Number(field) : NaN));
+      if (!Number.isFinite(pts) || !Number.isFinite(length)) return;
+      start = Math.min(start, pts);
+      end = Math.max(end, pts + length);
+    };
+    child.stdout.on('data', (chunk) => {
+      const lines = (pending + chunk).split('\n');
+      pending = lines.pop();
+      for (const line of lines) consume(line);
+    });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', (error) => reject(new Error(`ffprobe: ${error.message}`)));
+    child.on('close', (code) => {
+      if (code !== 0) return reject(new Error(`ffprobe exited ${code}: ${stderr.trim()}`));
+      consume(pending);
+      resolve(end - start);
+    });
+  });
 }
 
 async function findProjectRoot(cwd) {
@@ -281,7 +296,7 @@ async function requireFfmpeg51() {
   }
 }
 
-function detectChanges(video, info, range, crop, { threshold, minGap }) {
+function detectChanges(video, info, range, crop, { threshold, minGap, max }) {
   const sourceWidth = crop?.pixels.width ?? info.width;
   const sourceHeight = crop?.pixels.height ?? info.height;
   const height = Math.max(2, Math.round(ANALYSIS_WIDTH * sourceHeight / sourceWidth / 2) * 2);
@@ -295,6 +310,7 @@ function detectChanges(video, info, range, crop, { threshold, minGap }) {
     const pendingFrames = [];
     const pendingTimes = [];
     const events = [];
+    let candidates = 0;
     const errors = [];
     let decoded = 0;
     let failed;
@@ -318,7 +334,13 @@ function detectChanges(video, info, range, crop, { threshold, minGap }) {
         if (!(time > range.start && time < range.end) || time - lastReport < minGap - 1e-9) continue;
         const value = score(frame);
         if (value > threshold) {
-          events.push({ time, score: Math.round(value * 1e6) / 1e6 });
+          const event = { time, score: Math.round(value * 1e6) / 1e6 };
+          candidates++;
+          // Keep the highest scores, then the earliest times on ties.
+          const index = events.findIndex((kept) => kept.score < event.score || (kept.score === event.score && kept.time > event.time));
+          if (index >= 0) events.splice(index, 0, event);
+          else if (events.length < max) events.push(event);
+          if (events.length > max) events.pop();
           reference = frame;
           lastReport = time;
         }
@@ -361,7 +383,7 @@ function detectChanges(video, info, range, crop, { threshold, minGap }) {
         return reject(new Error(`ffmpeg frame/pts mismatch: ${pendingFrames.length} frames and ${pendingTimes.length} times unpaired, ${filled} trailing bytes`));
       }
       if (!decoded) return reject(new Error(`no decodable frames between ${formatTimecode(range.start)} and ${formatTimecode(range.end)}`));
-      resolve(events);
+      resolve({ events, candidates });
     });
   });
 }
@@ -560,12 +582,12 @@ export async function main(args) {
     const max = numberOption(options.max ?? 48, 'max', 1, 240, true);
     range = resolveRange(options, info);
     await requireFfmpeg51();
-    const found = await detectChanges(video, info, range, crop, { threshold, minGap });
-    const truncated = found.length > max;
-    const kept = truncated ? [...found].sort((a, b) => b.score - a.score || a.time - b.time).slice(0, max).sort((a, b) => a.time - b.time) : found;
+    const { events, candidates } = await detectChanges(video, info, range, crop, { threshold, minGap, max });
+    const truncated = candidates > max;
+    const kept = events.sort((a, b) => a.time - b.time);
     times = [range.start, ...kept.map((event) => event.time)];
     scores = [null, ...kept.map((event) => event.score)];
-    detection = { metric: `gray-diff>${PIXEL_DELTA}@${ANALYSIS_WIDTH}px,${ANALYSIS_FPS}fps vs last detected candidate`, threshold, minGap, candidates: found.length, truncated };
+    detection = { metric: `gray-diff>${PIXEL_DELTA}@${ANALYSIS_WIDTH}px,${ANALYSIS_FPS}fps vs last detected candidate`, threshold, minGap, candidates, truncated };
   } else {
     if (options.at === undefined) throw new Error('frame requires --at');
     times = [...new Set(options.at.map((value) => {
