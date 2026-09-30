@@ -9,7 +9,7 @@ Use when a task requires understanding a local video. Needs Node.js, FFmpeg, and
 
 1. `agvid probe a.mov [b.mov ...]` for duration, displayed size, `sar`, fps, codec. Several videos print an array; failed ones are `{video, error}` and exit 1.
 2. `agvid overview video.mov` samples 12 evenly spaced frames (`--frames 1-64`). Open the `sheets` paths first. Each tile's bottom-left label is its timecode; very small tiles have none.
-3. Screen recording or UI flow: `agvid changes video.mov` writes the range start plus a frame at each detected change. Open its `sheets`; `frames[].score` is the changed-pixel share (`null` for the first). Options: `--threshold` (default 0.002), `--min-gap` (0.5s), `--max` (48, up to 240).
+3. Screen recording or UI flow: `agvid changes video.mov` writes the range start plus a frame at each detected change. Open its `sheets`; `frames[].score` is the RGB changed-pixel share (`null` for the first). It samples at up to 30 fps at 256 pixels wide and counts pixels where any channel changes by more than 16/255. Options: `--threshold` (default 0.002), `--min-gap` (0.5s), `--max` (48, up to 240), `--analysis-fps` (1-60, default 30), `--analysis-width` (64-512, default 256).
 4. Zoom in: `agvid inspect video.mov --around 00:07.5 --window 2s --fps 4` (total centered window, clipped) or `--start 00:05 --end 00:09`. `agvid frame video.mov --at 00:07.5` for one moment (no sheet).
 5. Batch instead of repeating calls: `--at 1,4.5,9` and `--around 3,12` (comma list or repeated flag). `--at` is deduped and sorted; each `--around` is its own window with its own sheets.
 
