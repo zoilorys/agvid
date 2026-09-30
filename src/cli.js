@@ -10,15 +10,16 @@ Commands:
   overview [--frames N] [--start TIME] [--end TIME] [--crop X,Y,W,H] [--width PX] [--output DIR] <video>
   inspect <video> (--around TIME [--window DURATION] | [--start TIME] [--end TIME]) [--fps N] [--crop X,Y,W,H] [--width PX] [--output DIR]
   frame <video> --at TIME[,TIME...] [--crop X,Y,W,H] [--width PX] [--output DIR]
-  changes <video> [--start TIME] [--end TIME] [--crop X,Y,W,H] [--threshold X] [--min-gap DURATION] [--max N] [--width PX] [--output DIR]
+  changes <video> [--start TIME] [--end TIME] [--crop X,Y,W,H] [--threshold X] [--min-gap DURATION] [--max N] [--analysis-fps N] [--analysis-width PX] [--width PX] [--output DIR]
   probe <video>...
 
 --at and --around take comma lists or repeat the flag. --at times are deduped and sorted;
 each --around gets its own window and sheets (manifest windows[]). Up to 240 frames.
 changes writes the range start plus each frame where over --threshold (default 0.002) of the
-picture differs from the last detected candidate, at least --min-gap (default 0.5s) apart;
+picture differs in any RGB channel from the last detected candidate, at least --min-gap (default 0.5s) apart;
 --max (default 48, up to 240) keeps the highest scores. It decodes the whole range (sampled
-up to 10 fps): use --start/--end on long videos. Needs FFmpeg 5.1+. --crop limits detection
+up to 30 fps at 256px wide by default). --analysis-fps (1-60) and --analysis-width (64-512)
+tune detection cost and sensitivity. Use --start/--end on long videos. Needs FFmpeg 5.1+. --crop limits detection
 to the region; use it for small UI changes.
 TIME accepts seconds or HH:MM:SS.s. DURATION accepts seconds, with optional s suffix.
 --end is clamped to the video duration. --start/--end cannot combine with --around/--window.
@@ -35,7 +36,7 @@ const OPTIONS = {
   overview: new Set(['frames', 'start', 'end', 'crop', 'width', 'output']),
   inspect: new Set(['around', 'window', 'fps', 'start', 'end', 'crop', 'width', 'output']),
   frame: new Set(['at', 'crop', 'width', 'output']),
-  changes: new Set(['start', 'end', 'crop', 'threshold', 'min-gap', 'max', 'width', 'output']),
+  changes: new Set(['start', 'end', 'crop', 'threshold', 'min-gap', 'max', 'analysis-fps', 'analysis-width', 'width', 'output']),
   probe: new Set(),
 };
 
@@ -259,12 +260,12 @@ async function extract(video, time, width, filename, crop) {
   await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-ss', String(time), '-i', video, '-map', '0:v:0', '-frames:v', '1', '-vf', `${cut}scale=${width}:max(2\\,round(${width}/dar/2)*2),setsar=1`, '-threads:v', '1', '-q:v', '4', '-y', filename]);
 }
 
-const ANALYSIS_FPS = 10;
-const ANALYSIS_WIDTH = 160;
+const ANALYSIS_FPS = 30;
+const ANALYSIS_WIDTH = 256;
 const PIXEL_DELTA = 16;
 
-// One decode pass over the range: 160-px-wide gray source frames thinned to at most 10/s (select keeps source pts;
-// no fps resampling), each scored as the share of pixels differing by more than 16/255 from the last reported frame
+// One decode pass over the range: RGB source frames thinned to at most analysisFps/s (select keeps source pts;
+// no fps resampling), each scored as the share of pixels with any channel differing by more than 16/255 from the last reported frame
 // (initially the first decoded one, at the range start). Times are source pts from showinfo, which -ss input seeking
 // makes relative to the range start. Streams rawvideo; keeps only the
 // reference frame and frames still waiting for their pts line.
@@ -277,15 +278,16 @@ async function requireFfmpeg51() {
   }
 }
 
-function detectChanges(video, info, range, crop, { threshold, minGap }) {
+function detectChanges(video, info, range, crop, { threshold, minGap, analysisFps, analysisWidth }) {
   const sourceWidth = crop?.pixels.width ?? info.width;
   const sourceHeight = crop?.pixels.height ?? info.height;
-  const height = Math.max(2, Math.round(ANALYSIS_WIDTH * sourceHeight / sourceWidth / 2) * 2);
-  const size = ANALYSIS_WIDTH * height;
+  const height = Math.max(2, Math.round(analysisWidth * sourceHeight / sourceWidth / 2) * 2);
+  const pixels = analysisWidth * height;
+  const size = pixels * 3;
   const cut = crop ? `crop=${crop.pixels.width}:${crop.pixels.height}:${crop.pixels.x}:${crop.pixels.y},` : '';
   const args = ['-hide_banner', '-nostats', '-loglevel', 'info', '-ss', String(range.start), '-to', String(range.end), '-i', video,
-    '-map', '0:v:0', '-vf', `${cut}select='isnan(prev_selected_t)+gte(t-prev_selected_t,${1 / ANALYSIS_FPS - 1e-6})',scale=${ANALYSIS_WIDTH}:${height},format=gray,showinfo`,
-    '-fps_mode', 'passthrough', '-threads:v', '1', '-f', 'rawvideo', '-pix_fmt', 'gray', '-'];
+    '-map', '0:v:0', '-vf', `${cut}select='isnan(prev_selected_t)+gte(t-prev_selected_t,${1 / analysisFps - 1e-6})',scale=${analysisWidth}:${height},format=rgb24,showinfo`,
+    '-fps_mode', 'passthrough', '-threads:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'];
   return new Promise((resolve, reject) => {
     const child = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     const pendingFrames = [];
@@ -301,8 +303,12 @@ function detectChanges(video, info, range, crop, { threshold, minGap }) {
     let line = '';
     const score = (frame) => {
       let changed = 0;
-      for (let i = 0; i < size; i++) if (Math.abs(frame[i] - reference[i]) > PIXEL_DELTA) changed++;
-      return changed / size;
+      for (let i = 0; i < size; i += 3) {
+        if (Math.abs(frame[i] - reference[i]) > PIXEL_DELTA ||
+            Math.abs(frame[i + 1] - reference[i + 1]) > PIXEL_DELTA ||
+            Math.abs(frame[i + 2] - reference[i + 2]) > PIXEL_DELTA) changed++;
+      }
+      return changed / pixels;
     };
     const drain = () => {
       while (pendingFrames.length && pendingTimes.length) {
@@ -552,14 +558,16 @@ export async function main(args) {
     if (!(threshold > 0 && threshold <= 1)) throw new Error('--threshold must be a fraction above 0 and at most 1');
     const minGap = numberOption(parseTime(options['min-gap'] ?? '0.5'), 'min-gap', 0, 3600);
     const max = numberOption(options.max ?? 48, 'max', 1, 240, true);
+    const analysisFps = numberOption(options['analysis-fps'] ?? ANALYSIS_FPS, 'analysis-fps', 1, 60);
+    const analysisWidth = numberOption(options['analysis-width'] ?? ANALYSIS_WIDTH, 'analysis-width', 64, 512, true);
     range = resolveRange(options, info);
     await requireFfmpeg51();
-    const found = await detectChanges(video, info, range, crop, { threshold, minGap });
+    const found = await detectChanges(video, info, range, crop, { threshold, minGap, analysisFps, analysisWidth });
     const truncated = found.length > max;
     const kept = truncated ? [...found].sort((a, b) => b.score - a.score || a.time - b.time).slice(0, max).sort((a, b) => a.time - b.time) : found;
     times = [range.start, ...kept.map((event) => event.time)];
     scores = [null, ...kept.map((event) => event.score)];
-    detection = { metric: `gray-diff>${PIXEL_DELTA}@${ANALYSIS_WIDTH}px,${ANALYSIS_FPS}fps vs last detected candidate`, threshold, minGap, candidates: found.length, truncated };
+    detection = { metric: `RGB any-channel-diff>${PIXEL_DELTA}@${analysisWidth}px,${analysisFps}fps vs last detected candidate`, threshold, minGap, candidates: found.length, truncated };
   } else {
     if (options.at === undefined) throw new Error('frame requires --at');
     times = [...new Set(options.at.map((value) => {

@@ -537,6 +537,36 @@ test('changes finds small and large UI changes', async () => {
   });
 });
 
+test('changes detects a color swap with nearly unchanged grayscale brightness', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'color.mp4');
+    // Red (Y≈54) becomes dark green (Y≈54); grayscale analysis misses the panel.
+    ffmpeg('-f', 'lavfi', '-i', 'color=0xff0000:size=320x180:rate=30:duration=2',
+      '-vf', "drawbox=x=40:y=30:w=240:h=120:color=0x004c00:t=fill:enable='gte(t,1)'",
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', source);
+    const output = success('changes', source, '--output', path.join(directory, 'out'));
+    const manifest = await changesManifest(output);
+    assert.equal(output.changes, 1);
+    assert.ok(Math.abs(manifest.frames[1].time - 1) <= 0.04, String(manifest.frames[1].time));
+    assert.match(manifest.detection.metric, /RGB any-channel-diff>16@256px,30fps/);
+  });
+});
+
+test('changes samples a brief UI flash between 10 fps ticks', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'flash.mp4');
+    // The panel exists only at 0.55 and 0.567 s in a 60 fps source.
+    ffmpeg('-f', 'lavfi', '-i', 'color=black:size=320x180:rate=60:duration=1',
+      '-vf', "drawbox=x=40:y=20:w=240:h=140:color=white:t=fill:enable='between(n,33,34)'",
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', source);
+    const output = success('changes', source, '--output', path.join(directory, 'out'));
+    const manifest = await changesManifest(output);
+    assert.ok(manifest.frames.some((frame) => Math.abs(frame.time - 34 / 60) < 0.002), JSON.stringify(manifest.frames));
+    const coarse = success('changes', source, '--analysis-fps', '10', '--output', path.join(directory, 'coarse'));
+    assert.equal(coarse.changes, 0);
+  });
+});
+
 test('crop restricts detection and ranges bound it', async () => {
   await withTempDirectory(async (directory) => {
     const source = uiClip(directory);
