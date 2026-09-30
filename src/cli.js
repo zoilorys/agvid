@@ -7,11 +7,11 @@ import { fileURLToPath } from 'node:url';
 const HELP = `agvid <command> <video> [options]
 
 Commands:
-  overview [--frames N] [--start TIME] [--end TIME] [--crop X,Y,W,H] [--width PX] [--output DIR] <video>
-  inspect <video> (--around TIME [--window DURATION] | [--start TIME] [--end TIME]) [--fps N] [--crop X,Y,W,H] [--width PX] [--output DIR]
-  frame <video> --at TIME[,TIME...] [--crop X,Y,W,H] [--width PX] [--output DIR]
-  changes <video> [--start TIME] [--end TIME] [--crop X,Y,W,H] [--threshold X] [--min-gap DURATION] [--max N] [--width PX] [--output DIR]
-  probe <video>...
+  overview [--video-stream N] [--frames N] [--start TIME] [--end TIME] [--crop X,Y,W,H] [--width PX] [--output DIR] <video>
+  inspect <video> [--video-stream N] (--around TIME [--window DURATION] | [--start TIME] [--end TIME]) [--fps N] [--crop X,Y,W,H] [--width PX] [--output DIR]
+  frame <video> [--video-stream N] --at TIME[,TIME...] [--crop X,Y,W,H] [--width PX] [--output DIR]
+  changes <video> [--video-stream N] [--start TIME] [--end TIME] [--crop X,Y,W,H] [--threshold X] [--min-gap DURATION] [--max N] [--width PX] [--output DIR]
+  probe [--video-stream N] <video>...
 
 --at and --around take comma lists or repeat the flag. --at times are deduped and sorted;
 each --around gets its own window and sheets (manifest windows[]). Up to 240 frames.
@@ -25,6 +25,7 @@ TIME accepts seconds or HH:MM:SS.s. DURATION accepts seconds, with optional s su
 --crop takes fractions 0-1 of the displayed frame (left, top, width, height) and cuts
 that region at source resolution before --width scaling; it is never enlarged.
 --window is the total duration centered on --around. Options also accept --key=value.
+--video-stream N selects the zero-based video stream (0:v:N), default 0, on every command.
 Writes JPEG frames and manifest.json; overview, inspect and changes also write
 timecode-labeled sheet-NN.jpg. Output defaults to .agvid/runs/ under the git root (else cwd);
 --output DIR must be new or empty. probe with several videos prints an array, with
@@ -32,11 +33,11 @@ timecode-labeled sheet-NN.jpg. Output defaults to .agvid/runs/ under the git roo
 FFmpeg and FFprobe must be available on PATH.`;
 
 const OPTIONS = {
-  overview: new Set(['frames', 'start', 'end', 'crop', 'width', 'output']),
-  inspect: new Set(['around', 'window', 'fps', 'start', 'end', 'crop', 'width', 'output']),
-  frame: new Set(['at', 'crop', 'width', 'output']),
-  changes: new Set(['start', 'end', 'crop', 'threshold', 'min-gap', 'max', 'width', 'output']),
-  probe: new Set(),
+  overview: new Set(['frames', 'start', 'end', 'crop', 'width', 'output', 'video-stream']),
+  inspect: new Set(['around', 'window', 'fps', 'start', 'end', 'crop', 'width', 'output', 'video-stream']),
+  frame: new Set(['at', 'crop', 'width', 'output', 'video-stream']),
+  changes: new Set(['start', 'end', 'crop', 'threshold', 'min-gap', 'max', 'width', 'output', 'video-stream']),
+  probe: new Set(['video-stream']),
 };
 
 const MULTI = new Set(['at', 'around']);
@@ -65,6 +66,13 @@ function numberOption(value, name, min, max, integer = false) {
     throw new Error(`--${name} must be ${integer ? 'an integer' : 'a number'} from ${min} to ${max}`);
   }
   return number;
+}
+
+function videoStreamOption(value) {
+  if (!/^(0|[1-9]\d*)$/.test(String(value)) || !Number.isSafeInteger(Number(value))) {
+    throw new Error('--video-stream must be a non-negative integer');
+  }
+  return Number(value);
 }
 
 // Resolves optional --start/--end to { start, end } seconds within the video; end is clamped to the duration.
@@ -144,12 +152,13 @@ function run(program, args) {
   });
 }
 
-async function probe(video) {
-  // No -select_streams: the full listing also reveals audio. The first video stream matches FFmpeg's 0:v:0.
-  const raw = await run('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,width,height,avg_frame_rate,codec_name,duration,nb_frames,pix_fmt,bits_per_raw_sample,sample_aspect_ratio:stream_side_data=rotation:stream_tags=DURATION,rotate', '-of', 'json', video]);
+async function probe(video, videoStream) {
+  // Keep the full listing for audio presence and the container index of the selected video stream.
+  const raw = await run('ffprobe', ['-v', 'error', '-show_entries', 'stream=index,codec_type,width,height,avg_frame_rate,codec_name,duration,nb_frames,pix_fmt,bits_per_raw_sample,sample_aspect_ratio:stream_side_data=rotation:stream_tags=DURATION,rotate', '-of', 'json', video]);
   const streams = JSON.parse(raw).streams ?? [];
-  const stream = streams.find((entry) => entry.codec_type === 'video');
-  if (!stream) throw new Error('no video stream found');
+  const videoStreams = streams.filter((entry) => entry.codec_type === 'video');
+  const stream = videoStreams[videoStream];
+  if (!stream) throw new Error(`video stream ${videoStream} not found (${videoStreams.length} video streams)`);
   const valid = (value) => Number.isFinite(value) && value > 0;
   let duration = Number(stream.duration);
   let durationSource = 'stream';
@@ -160,10 +169,10 @@ async function probe(video) {
   }
   if (!valid(duration)) {
     durationSource = 'packets';
-    duration = await packetDuration(video);
+    duration = await packetDuration(video, videoStream);
   }
   if (!valid(duration)) {
-    throw new Error('first video stream has no duration metadata; provide a video with a known video-stream duration');
+    throw new Error(`video stream ${videoStream} has no duration metadata; provide a video with a known video-stream duration`);
   }
   if (!Number.isInteger(stream.width) || stream.width <= 0 || !Number.isInteger(stream.height) || stream.height <= 0) {
     throw new Error('video dimensions are unavailable');
@@ -182,15 +191,15 @@ async function probe(video) {
   const [sarNum, sarDen] = String(stream.sample_aspect_ratio ?? '').split(':').map(Number);
   const storedSar = sarNum > 0 && sarDen > 0 ? sarNum / sarDen : 1;
   const sar = swap ? 1 / storedSar : storedSar;
-  return { video, duration, width: swap ? stream.height : stream.width, height: swap ? stream.width : stream.height,
+  return { video, videoStream, streamIndex: stream.index, duration, width: swap ? stream.height : stream.width, height: swap ? stream.width : stream.height,
     sar, rotation, codedWidth: stream.width, codedHeight: stream.height, fps, frameRate: stream.avg_frame_rate ?? null,
     frameCount, frameCountEstimated, codec: stream.codec_name, pixelFormat: stream.pix_fmt ?? null,
     bitDepth: Number.isInteger(bitDepth) && bitDepth > 0 ? bitDepth : null,
     hasAudio: streams.some((entry) => entry.codec_type === 'audio'), durationSource };
 }
 
-async function packetDuration(video) {
-  const raw = await run('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'packet=pts_time,duration_time', '-of', 'csv=p=0', video]);
+async function packetDuration(video, videoStream) {
+  const raw = await run('ffprobe', ['-v', 'error', '-select_streams', `v:${videoStream}`, '-show_entries', 'packet=pts_time,duration_time', '-of', 'csv=p=0', video]);
   let start = Infinity;
   let end = -Infinity;
   for (const line of raw.split('\n')) {
@@ -254,9 +263,9 @@ async function outputDirectory(video, command, requested) {
   }
 }
 
-async function extract(video, time, width, filename, crop) {
+async function extract(video, videoStream, time, width, filename, crop) {
   const cut = crop ? `crop=${crop.pixels.width}:${crop.pixels.height}:${crop.pixels.x}:${crop.pixels.y},` : '';
-  await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-ss', String(time), '-i', video, '-map', '0:v:0', '-frames:v', '1', '-vf', `${cut}scale=${width}:max(2\\,round(${width}/dar/2)*2),setsar=1`, '-threads:v', '1', '-q:v', '4', '-y', filename]);
+  await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-ss', String(time), '-i', video, '-map', `0:v:${videoStream}`, '-frames:v', '1', '-vf', `${cut}scale=${width}:max(2\\,round(${width}/dar/2)*2),setsar=1`, '-threads:v', '1', '-q:v', '4', '-y', filename]);
 }
 
 const ANALYSIS_FPS = 10;
@@ -284,7 +293,7 @@ function detectChanges(video, info, range, crop, { threshold, minGap }) {
   const size = ANALYSIS_WIDTH * height;
   const cut = crop ? `crop=${crop.pixels.width}:${crop.pixels.height}:${crop.pixels.x}:${crop.pixels.y},` : '';
   const args = ['-hide_banner', '-nostats', '-loglevel', 'info', '-ss', String(range.start), '-to', String(range.end), '-i', video,
-    '-map', '0:v:0', '-vf', `${cut}select='isnan(prev_selected_t)+gte(t-prev_selected_t,${1 / ANALYSIS_FPS - 1e-6})',scale=${ANALYSIS_WIDTH}:${height},format=gray,showinfo`,
+    '-map', `0:v:${info.videoStream}`, '-vf', `${cut}select='isnan(prev_selected_t)+gte(t-prev_selected_t,${1 / ANALYSIS_FPS - 1e-6})',scale=${ANALYSIS_WIDTH}:${height},format=gray,showinfo`,
     '-fps_mode', 'passthrough', '-threads:v', '1', '-f', 'rawvideo', '-pix_fmt', 'gray', '-'];
   return new Promise((resolve, reject) => {
     const child = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -498,18 +507,19 @@ export async function main(args) {
     return;
   }
   const { command, video, videos, options } = parseArgs(args);
+  const videoStream = videoStreamOption(options['video-stream'] ?? '0');
   if (command === 'probe') {
     if (videos.length === 1) {
-      console.log(JSON.stringify(await probe(videos[0]), null, 2));
+      console.log(JSON.stringify(await probe(videos[0], videoStream), null, 2));
       return;
     }
     const results = await pool(videos, Math.min(os.availableParallelism(), 8),
-      (file) => probe(file).catch((error) => ({ video: file, error: error.message })));
+      (file) => probe(file, videoStream).catch((error) => ({ video: file, error: error.message })));
     if (results.some((entry) => 'error' in entry)) process.exitCode = 1;
     console.log(JSON.stringify(results, null, 2));
     return;
   }
-  const info = await probe(video);
+  const info = await probe(video, videoStream);
   const crop = options.crop === undefined ? undefined : parseCrop(options.crop, info);
   const width = Math.min(crop?.pixels.displayed.width ?? info.width, numberOption(options.width ?? 640, 'width', 64, 4096, true));
   let times;
@@ -578,11 +588,11 @@ export async function main(args) {
     const target = path.join(directory, filename);
     produced.push(target);
     let extractionError;
-    try { await extract(video, time, width, target, crop); }
+    try { await extract(video, videoStream, time, width, target, crop); }
     catch (error) { extractionError = error; }
     if (extractionError && await nonempty(target)) throw extractionError;
     if (!(await nonempty(target)) && info.duration - time < 0.1) {
-      await extract(video, Math.max(0, info.duration - 0.1), width, target, crop);
+      await extract(video, videoStream, Math.max(0, info.duration - 0.1), width, target, crop);
     }
     if (!(await nonempty(target))) throw extractionError ?? new Error(`FFmpeg produced no frame for ${time}s`);
     return { file: filename, time, timecode };
