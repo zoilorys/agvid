@@ -50,7 +50,7 @@ agvid probe a.mov b.mov
 
 ### Ranges
 
-`overview`, `inspect` and `changes` accept `--start TIME` and `--end TIME` (seconds or `HH:MM:SS.s`) to work on part of the video. `--end` is clamped to the duration; `--start` must be before it. For `inspect`, `--start/--end` replace `--around/--window` (combining them is an error). The manifest gets `range: { start, end }` when either is passed.
+`overview`, `inspect` and `changes` accept `--start TIME` and `--end TIME` (seconds, `MM:SS.s`, or `HH:MM:SS.s`) to work on part of the video. Clock minute and second fields must be below 60. `--end` is clamped to the duration; `--start` must be before it. For `inspect`, `--start/--end` replace `--around/--window` (combining them is an error). The manifest gets `range: { start, end }` when either is passed.
 
 ### Batching
 
@@ -78,7 +78,7 @@ agvid changes recording.mov
 
 `--window` defaults to 2 seconds and is the total duration, so `--around 00:07.5 --window 2s` covers roughly 6.5 to 8.5 seconds. The window clips at the start or end of the video. `--fps` defaults to 4. `inspect` caps output at 240 frames; `overview` accepts 1 to 64 frames.
 
-Frames are evidence for a moment, not frame accurate: FFmpeg seeking can land on a nearby decoded frame, depending on the source codec. Use the timestamps as requested positions.
+Frames are evidence for a moment, not frame accurate: FFmpeg seeking can land on a nearby decoded frame, depending on the source codec. Manifest times keep the requested precision; filenames and sheet labels round to milliseconds.
 
 ## Develop
 
