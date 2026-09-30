@@ -90,11 +90,11 @@ test('probe of several videos keeps argument order and reports failures inline',
 
 test('frame accepts --option=value spelling and rejects duplicates across spellings', async () => {
   await withTempDirectory(async (directory) => {
-    // A sub-millisecond request rounds to the millisecond the filename names.
+    // The filename uses milliseconds; the manifest keeps the requested position.
     const output = success('frame', video, '--at=7.5004', '--width=160', `--output=${directory}`);
     assert.equal(output.directory, directory);
     const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
-    assert.deepEqual([manifest.frames[0].time, manifest.frames[0].file], [7.5, 'frame-0000_00-07.500.jpg']);
+    assert.deepEqual([manifest.frames[0].time, manifest.frames[0].file], [7.5004, 'frame-0000_00-07.500.jpg']);
     assert.ok(jpegInfo(path.join(output.directory, manifest.frames[0].file)).width <= 160);
     const duplicate = invoke('frame', video, '--width', '160', '--width=320', '--output', path.join(directory, 'dup'));
     assert.notEqual(duplicate.status, 0);
@@ -160,7 +160,7 @@ test('single inspect has one window; an out-of-range --around in a batch fails w
   await withTempDirectory(async (directory) => {
     const output = success('inspect', video, '--around', '5.0004', '--width', '160', '--output', path.join(directory, 'one'));
     const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
-    assert.deepEqual(manifest.windows.map((w) => [w.around, ...w.frames]), [[5, 0, manifest.frames.length - 1]]);
+    assert.deepEqual(manifest.windows.map((w) => [w.around, ...w.frames]), [[5.0004, 0, manifest.frames.length - 1]]);
     const out = path.join(directory, 'bad');
     const result = invoke('inspect', video, '--around', '3,99', '--output', out);
     assert.notEqual(result.status, 0);
@@ -243,8 +243,49 @@ test('a frame time that rounds up to a whole minute carries into the minutes', a
     ffmpeg('-f', 'lavfi', '-i', 'testsrc2=size=64x36:rate=1:duration=61', '-c:v', 'mpeg4', '-y', source);
     const output = success('frame', source, '--at', '59.9996', '--output', path.join(directory, 'out'));
     const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
-    assert.deepEqual(manifest.frames, [{ file: 'frame-0000_01-00.000.jpg', time: 60, timecode: '01:00.000' }]);
+    assert.deepEqual(manifest.frames, [{ file: 'frame-0000_01-00.000.jpg', time: 59.9996, timecode: '01:00.000' }]);
     jpegInfo(path.join(output.directory, manifest.frames[0].file));
+  });
+});
+
+test('sub-millisecond requests near the end of a one-second video stay in bounds', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'one-second.mp4');
+    ffmpeg('-f', 'lavfi', '-i', 'testsrc2=size=64x36:rate=10:duration=1', '-c:v', 'mpeg4', '-y', source);
+    const frame = success('frame', source, '--at', '0.9996', '--output', path.join(directory, 'frame'));
+    const frameManifest = JSON.parse(await readFile(frame.manifest, 'utf8'));
+    assert.equal(frameManifest.frames[0].time, 0.9996);
+    jpegInfo(path.join(frame.directory, frameManifest.frames[0].file));
+
+    const overview = success('overview', source, '--start', '0', '--end', '0.001', '--frames', '2', '--output', path.join(directory, 'overview'));
+    const overviewManifest = JSON.parse(await readFile(overview.manifest, 'utf8'));
+    assert.deepEqual(overviewManifest.frames.map(({ time }) => time), [0.00025, 0.00075]);
+    assert.ok(overviewManifest.frames.every(({ time }) => time < overviewManifest.range.end));
+    for (const { file } of overviewManifest.frames) jpegInfo(path.join(overview.directory, file));
+
+    const inspect = success('inspect', source, '--around', '0.9996', '--window', '0.001', '--output', path.join(directory, 'inspect'));
+    const inspectManifest = JSON.parse(await readFile(inspect.manifest, 'utf8'));
+    assert.equal(inspectManifest.windows[0].around, 0.9996);
+    assert.ok(inspectManifest.frames[0].time >= inspectManifest.windows[0].start);
+    assert.ok(inspectManifest.frames[0].time < inspectManifest.windows[0].end);
+    jpegInfo(path.join(inspect.directory, inspectManifest.frames[0].file));
+  });
+});
+
+test('invalid clock fields fail before an extraction starts', async () => {
+  await withTempDirectory(async (directory) => {
+    for (const [command, options] of [
+      ['frame', ['--at', '00:99:99']],
+      ['frame', ['--at', '99:00']],
+      ['overview', ['--start', '00:01:60']],
+      ['inspect', ['--around', '00:60:00']],
+    ]) {
+      const output = path.join(directory, command);
+      const result = invoke(command, video, ...options, '--output', output);
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /invalid time:/);
+    }
+    assert.deepEqual(await readdir(directory), []);
   });
 });
 

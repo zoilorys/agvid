@@ -19,4 +19,4 @@ On long videos, pass `--start`/`--end` (to overview, inspect, changes); `changes
 
 Output: printed JSON has `directory`, `sheets` (not for a single `frame`), `manifest`, `frames` (count; `changes` also prints `changes`). `manifest.json` maps each frame `file` to `time` and `timecode`, plus `sheets`, `crop`, `range`, `windows`, `detection` where they apply. Goes to `.agvid/runs/<video>-<command>[-N]/`; `--output DIR` must be new or empty. `--width PX` (64-4096) caps width, default 640.
 
-Times and labels are requested positions; seeking is approximate for some codecs. Report observations with those timestamps.
+Manifest times keep requested positions, including sub-millisecond precision. Filenames and sheet labels round to milliseconds; seeking is approximate for some codecs. Report observations with manifest times.

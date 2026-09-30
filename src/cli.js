@@ -20,7 +20,9 @@ picture differs from the last detected candidate, at least --min-gap (default 0.
 --max (default 48, up to 240) keeps the highest scores. It decodes the whole range (sampled
 up to 10 fps): use --start/--end on long videos. Needs FFmpeg 5.1+. --crop limits detection
 to the region; use it for small UI changes.
-TIME accepts seconds or HH:MM:SS.s. DURATION accepts seconds, with optional s suffix.
+TIME accepts seconds, MM:SS.s, or HH:MM:SS.s; clock minute and second fields must be below 60.
+DURATION accepts seconds, with optional s suffix. Manifest times keep sub-millisecond precision;
+filenames and sheet labels round to milliseconds.
 --end is clamped to the video duration. --start/--end cannot combine with --around/--window.
 --crop takes fractions 0-1 of the displayed frame (left, top, width, height) and cuts
 that region at source resolution before --width scaling; it is never enlarged.
@@ -43,13 +45,15 @@ const MULTI = new Set(['at', 'around']);
 
 export function parseTime(value) {
   const parts = String(value).replace(/s$/, '').split(':');
-  if (parts.length > 3 || parts.some((part) => !/^\d+(?:\.\d+)?$/.test(part))) {
+  const clockFields = parts.length === 2 ? parts : parts.slice(1);
+  if (parts.length > 3 || parts.some((part, i) => !(i === parts.length - 1 ? /^\d+(?:\.\d+)?$/ : /^\d+$/).test(part))
+    || clockFields.some((part) => Number(part) >= 60)) {
     throw new Error(`invalid time: ${value}`);
   }
-  return parts.reduce((seconds, part) => seconds * 60 + Number(part), 0);
+  const seconds = parts.reduce((total, part) => total * 60 + Number(part), 0);
+  if (!Number.isFinite(seconds)) throw new Error(`invalid time: ${value}`);
+  return seconds;
 }
-
-const toMs = (seconds) => Math.round(seconds * 1000) / 1000;
 
 export function formatTimecode(seconds) {
   const total = Math.round(seconds * 1000);
@@ -69,8 +73,8 @@ function numberOption(value, name, min, max, integer = false) {
 
 // Resolves optional --start/--end to { start, end } seconds within the video; end is clamped to the duration.
 export function resolveRange(options, info) {
-  const start = options.start === undefined ? 0 : toMs(parseTime(options.start));
-  const end = options.end === undefined ? info.duration : Math.min(info.duration, toMs(parseTime(options.end)));
+  const start = options.start === undefined ? 0 : parseTime(options.start);
+  const end = options.end === undefined ? info.duration : Math.min(info.duration, parseTime(options.end));
   if (start >= info.duration) throw new Error(`--start ${formatTimecode(start)} must be before the video ends`);
   if (start >= end) throw new Error(`--start ${formatTimecode(start)} must be before --end ${formatTimecode(end)}`);
   return { start, end };
@@ -520,7 +524,7 @@ export async function main(args) {
   if (command === 'overview') {
     const count = numberOption(options.frames ?? 12, 'frames', 1, 64, true);
     const { start, end } = range = resolveRange(options, info);
-    times = Array.from({ length: count }, (_, i) => toMs(start + (end - start) * (i + 0.5) / count));
+    times = Array.from({ length: count }, (_, i) => start + (end - start) * (i + 0.5) / count);
   } else if (command === 'inspect') {
     const ranged = options.start !== undefined || options.end !== undefined;
     if (ranged && (options.around !== undefined || options.window !== undefined)) throw new Error('--start/--end cannot be combined with --around/--window');
@@ -529,7 +533,7 @@ export async function main(args) {
     let spans;
     if (ranged) spans = [{ around: null, ...resolveRange(options, info) }];
     else {
-      const arounds = [...new Set(options.around.map((value) => toMs(parseTime(value))))].sort((a, b) => a - b);
+      const arounds = [...new Set(options.around.map(parseTime))].sort((a, b) => a - b);
       const window = numberOption(parseTime(options.window ?? '2s'), 'window', 0.001, 3600);
       spans = arounds.map((around) => {
         if (around > info.duration) throw new Error(`--around ${formatTimecode(around)} is beyond the video duration`);
@@ -543,9 +547,11 @@ export async function main(args) {
       if (count < 1) throw new Error('inspect window contains no frames');
       if (times.length + count > 240) throw new Error('inspect would create over 240 frames; reduce --window, --fps or --around values');
       const first = times.length;
-      // Rounding moves a time by at most 0.5 ms, so times stay ordered and below end.
-      for (let i = 0; i < count; i++) times.push(toMs(Math.min(end - 0.001, start + (i + 0.5) / fps)));
-      windows.push({ around, start: toMs(start), end: toMs(end), frames: [first, times.length - 1] });
+      for (let i = 0; i < count; i++) {
+        const segmentStart = start + i / fps;
+        times.push(segmentStart + Math.min(0.5 / fps, (end - segmentStart) / 2));
+      }
+      windows.push({ around, start, end, frames: [first, times.length - 1] });
     }
   } else if (command === 'changes') {
     const threshold = Number(options.threshold ?? 0.002);
@@ -563,7 +569,7 @@ export async function main(args) {
   } else {
     if (options.at === undefined) throw new Error('frame requires --at');
     times = [...new Set(options.at.map((value) => {
-      const time = toMs(parseTime(value));
+      const time = parseTime(value);
       if (time >= info.duration) throw new Error(`--at ${value} must be before the video ends`);
       return time;
     }))].sort((a, b) => a - b);
@@ -611,7 +617,7 @@ export async function main(args) {
       }
     }
     produced.push(path.join(directory, 'manifest.json.tmp'), path.join(directory, 'manifest.json'));
-    const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, ...(crop ? { crop } : {}), ...(range && (options.start !== undefined || options.end !== undefined) ? { range: { start: toMs(range.start), end: toMs(range.end) } } : {}), ...(detection ? { detection } : {}), frames, ...(windows ? { windows } : {}), ...(sheets ? { sheets } : {}) });
+    const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, ...(crop ? { crop } : {}), ...(range && (options.start !== undefined || options.end !== undefined) ? { range } : {}), ...(detection ? { detection } : {}), frames, ...(windows ? { windows } : {}), ...(sheets ? { sheets } : {}) });
     console.log(JSON.stringify({ directory, ...(sheets ? { sheets: sheets.map((sheet) => path.join(directory, sheet.file)) } : {}), manifest, frames: frames.length, ...(detection ? { changes: frames.length - 1 } : {}) }, null, 2));
   } catch (error) {
     if (created) {
