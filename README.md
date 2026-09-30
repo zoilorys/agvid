@@ -44,9 +44,15 @@ agvid inspect video.mov --around 00:07.5 --window 2s --fps 4
 agvid frame video.mov --at 00:07.5 --width 320
 agvid changes recording.mov --crop 0.5,0,0.5,0.5
 agvid probe a.mov b.mov
+agvid probe --video-stream 1 multi-track.mov
+agvid overview multi-track.mov --video-stream 1
 ```
 
 `overview` samples evenly across the video. `inspect` samples the centered window at the requested frame rate. `changes` finds moments where the picture changes (see below). All three write JPEG frames, `manifest.json`, and sheets `sheet-01.jpg`, … (at most 1568 px per side, split across several sheets when needed; `sheet-001.jpg`, … from 100 sheets), with each tile labeled bottom-left with its timecode. `frame` extracts JPEGs and no sheet, except a sheet when `--at` lists several times. Frame files are named like `frame-0003_00-07.500.jpg`. `probe` prints source metadata as JSON: duration (with `durationSource`), displayed and coded size, `sar` (sample aspect ratio, rotation-adjusted), rotation, fps, frame count, codec, pixel format, bit depth, and audio presence. With several videos it prints an array in argument order; a video that fails becomes `{ "video": "/abs/path", "error": "..." }` and the exit code is 1.
+
+### Select a video stream
+
+All commands accept `--video-stream N`. `N` is the zero-based video-stream ordinal used by FFmpeg's `0:v:N`, not the absolute stream index in the container. The default is `0`. For example, use `--video-stream 1` when the first video stream is cover art and the second is the footage. `probe --video-stream 1 a.mov b.mov` applies the same choice to both files; a file without that video stream gets an error entry. `probe` reports `videoStream` and `streamIndex` (the absolute container index). Image manifests record both in `source`.
 
 ### Ranges
 

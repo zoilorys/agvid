@@ -13,6 +13,8 @@ Use when a task requires understanding a local video. Needs Node.js, FFmpeg, and
 4. Zoom in: `agvid inspect video.mov --around 00:07.5 --window 2s --fps 4` (total centered window, clipped) or `--start 00:05 --end 00:09`. `agvid frame video.mov --at 00:07.5` for one moment (no sheet).
 5. Batch instead of repeating calls: `--at 1,4.5,9` and `--around 3,12` (comma list or repeated flag). `--at` is deduped and sorted; each `--around` is its own window with its own sheets.
 
+For a file with several video streams, pass `--video-stream N` to any command. `N` is zero-based among video streams (`0:v:N`), default `0`, and differs from the container's absolute stream index when audio comes first. `probe` reports both `videoStream` and `streamIndex`; manifests record them in `source`. A batched `probe --video-stream 1 a.mov b.mov` reports an error entry for each file without that stream.
+
 Crop with `--crop x,y,w,h` (fractions 0-1 of the displayed frame; works on overview, inspect, frame, changes). Estimate from a sheet tile: a button at the right edge of the tile's middle third, about 80% across and 40% down, roughly 15% wide and 20% tall, is `--crop 0.8,0.4,0.15,0.2`. Crop cuts at source resolution, so text stays legible. On `changes`, crop to the region of interest: a moving cursor-sized box stays under the default threshold, and small UI changes need a crop to register.
 
 On long videos, pass `--start`/`--end` (to overview, inspect, changes); `changes` decodes the whole range. `--end` is clamped to the duration. `changes` needs FFmpeg 5.1+.

@@ -88,6 +88,50 @@ test('probe of several videos keeps argument order and reports failures inline',
   });
 });
 
+test('selected video stream drives metadata, frames, sheets, and change analysis', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'multi.mp4');
+    ffmpeg('-f', 'lavfi', '-i', 'sine=frequency=440:duration=2',
+      '-f', 'lavfi', '-i', 'color=red:size=80x64:rate=4:duration=2',
+      '-f', 'lavfi', '-i', 'testsrc2=size=128x96:rate=4:duration=2',
+      '-map', '0:a', '-map', '1:v', '-map', '2:v', '-c:a', 'aac', '-c:v', 'mpeg4', '-y', source);
+
+    const first = success('probe', source);
+    const second = success('probe', source, '--video-stream=1');
+    assert.deepEqual([first.videoStream, first.streamIndex, first.width, first.height], [0, 1, 80, 64]);
+    assert.deepEqual([second.videoStream, second.streamIndex, second.width, second.height], [1, 2, 128, 96]);
+    const batch = invoke('probe', '--video-stream', '1', source, video);
+    assert.equal(batch.status, 1);
+    const batched = JSON.parse(batch.stdout);
+    assert.equal(batched[0].streamIndex, 2);
+    assert.match(batched[1].error, /video stream 1 not found/);
+
+    for (const [command, args] of [
+      ['frame', ['--at', '0.5']],
+      ['overview', ['--frames', '2']],
+      ['inspect', ['--around', '1', '--window', '1s', '--fps', '2']],
+      ['changes', ['--threshold', '0.01']],
+    ]) {
+      const output = success(command, source, '--video-stream', '1', ...args, '--output', path.join(directory, command));
+      const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+      assert.deepEqual([manifest.source.videoStream, manifest.source.streamIndex], [1, 2]);
+      const frame = jpegInfo(path.join(output.directory, manifest.frames[0].file));
+      assert.deepEqual([frame.width, frame.height], [128, 96]);
+      if (command !== 'frame') assert.ok(output.sheets.length);
+      if (command === 'changes') assert.ok(output.changes > 0);
+    }
+    const staticChanges = success('changes', source, '--video-stream', '0', '--output', path.join(directory, 'static'));
+    assert.equal(staticChanges.changes, 0);
+
+    for (const value of ['-1', '1.5', 'banana', '2']) {
+      const out = path.join(directory, `invalid-${value}`);
+      const failed = invoke('frame', source, '--video-stream', value, '--at', '0.5', '--output', out);
+      assert.notEqual(failed.status, 0);
+      assert.equal((await readdir(directory)).includes(path.basename(out)), false);
+    }
+  });
+});
+
 test('frame accepts --option=value spelling and rejects duplicates across spellings', async () => {
   await withTempDirectory(async (directory) => {
     // The filename uses milliseconds; the manifest keeps the requested position.
@@ -321,7 +365,7 @@ test('a video without stream duration fails with an actionable error', async () 
     const output = path.join(directory, 'out');
     const result = invoke('overview', source, '--output', output);
     assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /first video stream has no duration metadata.*provide a video/i);
+    assert.match(result.stderr, /video stream 0 has no duration metadata.*provide a video/i);
     assert.deepEqual(await readdir(directory), ['raw-video.m2v']);
   });
 });
