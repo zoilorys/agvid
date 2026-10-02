@@ -407,8 +407,9 @@ const LOCK = '.agvid.lock';
 
 // Claims `directory` for this run with an exclusively created lock file holding its pid and host. An emptiness check
 // alone lets two runs share an existing empty directory; whichever creates the lock first owns it. A lock left by a
-// killed run on this host is replaced under an exclusively created LOCK.reclaim guard: while a run holds the guard, no
-// other run can remove the stale lock, so two runs cannot both replace it, and none can delete a live lock.
+// killed run on this host is replaced under an exclusively created LOCK.reclaim guard. A stale lock's owner is gone and
+// other runs need the guard to remove it, so the lock this run read as stale is still the one it removes. A lock found
+// missing is never removed: a run that does not take the guard may have created it since.
 async function claim(directory) {
   const lock = path.join(directory, LOCK);
   const guard = `${lock}.reclaim`;
@@ -418,27 +419,26 @@ async function claim(directory) {
   if (await create(lock)) return lock;
   if (await create(guard)) {
     try {
-      if (await stale(lock)) {
-        await rm(lock, { force: true });
-        if (await create(lock)) return lock;
-      }
+      const state = await lockState(lock);
+      if (state === 'stale') await rm(lock, { force: true });
+      if (state !== 'held' && await create(lock)) return lock;
     } finally { await rm(guard, { force: true }); }
   }
   throw Object.assign(new Error(`output directory is in use by another agvid run: ${directory} (delete ${LOCK} if no run is active)`), { inUse: true });
 }
 
-// Whether a lock's owner is gone: written on this host by a process that no longer exists. A missing lock counts too.
-// Locks from other hosts (shared or container mounts), or unreadable ones, are kept.
-async function stale(lock) {
+// 'missing', 'stale' (written on this host by a process that no longer exists) or 'held'. Locks from other hosts
+// (shared or container mounts), or unreadable ones, count as held.
+async function lockState(lock) {
   let content;
   try { content = await readFile(lock, 'utf8'); }
-  catch (error) { if (error.code === 'ENOENT') return true; throw error; }
+  catch (error) { if (error.code === 'ENOENT') return 'missing'; throw error; }
   const [pid, host] = content.split('\n');
-  if (!/^[1-9]\d*$/.test(pid) || host !== os.hostname()) return false;
+  if (!/^[1-9]\d*$/.test(pid) || host !== os.hostname()) return 'held';
   // This run's own pid can only be a reused pid of a finished run.
-  if (Number(pid) === process.pid) return true;
-  try { process.kill(Number(pid), 0); return false; }
-  catch (error) { return error.code === 'ESRCH'; }
+  if (Number(pid) === process.pid) return 'stale';
+  try { process.kill(Number(pid), 0); return 'held'; }
+  catch (error) { return error.code === 'ESRCH' ? 'stale' : 'held'; }
 }
 
 // Returns the claimed output directory: { directory, lock, created, firstParent }.

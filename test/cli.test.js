@@ -4,6 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { formatTimecode } from '../src/cli.js';
 
 const video = path.resolve('test/fixtures/test.mov');
@@ -1419,6 +1420,61 @@ test('a lock left by a killed run on this host is reclaimed by exactly one of se
     await gate.release();
     const owner = (await Promise.all(runs.map((run) => run.exited))).find((result) => result.code === 0);
     assert.equal(JSON.parse(owner.stdout).directory, output);
+    assert.deepEqual((await readdir(output)).sort(), ['frame-0000_00-01.000.jpg', 'manifest.json']);
+  });
+});
+
+test('a lock released while another run checks it for staleness is not replaced over a new owner', async () => {
+  await withTempDirectory(async (directory) => {
+    const output = path.join(directory, 'out');
+    const lock = path.join(output, '.agvid.lock');
+    const sync = path.join(directory, 'hold');
+    await mkdir(output);
+    await mkdir(sync);
+    // This test process stands in for the live owner.
+    await writeFile(lock, `${process.pid}\n${os.hostname()}\n`);
+    // The checking run's read of the lock waits for 'read', then its result waits for 'resume'.
+    const hook = path.join(directory, 'hook.mjs');
+    await writeFile(hook, `import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+const readFile = fs.promises.readFile;
+const step = async (signal, wait) => {
+  fs.writeFileSync(${JSON.stringify(sync)} + '/' + signal, '');
+  while (!fs.existsSync(${JSON.stringify(sync)} + '/' + wait)) await new Promise((resolve) => setTimeout(resolve, 10));
+};
+fs.promises.readFile = async (file, ...rest) => {
+  if (!String(file).endsWith('.agvid.lock')) return readFile(file, ...rest);
+  await step('reading', 'read');
+  const result = await readFile(file, ...rest).then((content) => ({ content }), (error) => ({ error }));
+  await step('checked', 'resume');
+  if (result.error) throw result.error;
+  return result.content;
+};
+syncBuiltinESMExports();
+`);
+    const child = spawn(process.execPath, ['--import', pathToFileURL(hook).href, cli, 'frame', video, '--at', '1', '--output', output],
+      { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    const checker = new Promise((resolve) => child.on('close', (code) => resolve(code)));
+    const signaled = (name) => stat(path.join(sync, name)).then(() => true, () => false);
+    await until(() => signaled('reading'), 'the staleness check');
+    // The owner releases its lock just before the check reads it, and a new run claims the directory right after,
+    // holding it while it extracts.
+    await rm(lock);
+    await writeFile(path.join(sync, 'read'), '');
+    await until(() => signaled('checked'), 'the lock read');
+    const gate = await gatedFfmpeg(directory);
+    await gate.reset();
+    const newcomer = launch({ env: gate.env() }, 'frame', video, '--at', '1', '--output', output);
+    await until(async () => (await gate.pids()).length === 1, 'the new owner extraction');
+    const held = await readFile(lock, 'utf8');
+    await writeFile(path.join(sync, 'resume'), '');
+    assert.notEqual(await checker, 0);
+    assert.match(stderr, /in use by another agvid run/);
+    assert.equal(await readFile(lock, 'utf8'), held);
+    await gate.release();
+    assert.equal((await newcomer.exited).code, 0);
     assert.deepEqual((await readdir(output)).sort(), ['frame-0000_00-01.000.jpg', 'manifest.json']);
   });
 });
