@@ -434,7 +434,9 @@ async function claim(directory) {
 
 // Creates `file` holding `content` unless it exists. The content is written to `staging` first and hard-linked into
 // place, so `file` never appears empty: a run stalled before writing cannot have its lock mistaken for a killed run's
-// and replaced, then carry on alongside the replacement. Filesystems without hard links fall back to exclusive creation.
+// and replaced, then carry on alongside the replacement. Filesystems without hard links (exFAT, FAT) intentionally fall
+// back to exclusive creation: there a run stalled over a minute between creating and writing its lock can still be
+// displaced. That needs an unusual stall, and failing such filesystems outright would be worse.
 async function publish(file, content, staging) {
   await writeFile(staging, content, { flag: 'wx' });
   try {
