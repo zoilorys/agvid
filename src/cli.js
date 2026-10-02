@@ -534,7 +534,23 @@ function ownerState(content, modified) {
   catch (error) { return error.code === 'ESRCH' ? 'stale' : 'held'; }
 }
 
-// Returns the claimed output directory: { directory, lock, created, firstParent }.
+const WORK = `${LOCK}.work-`;
+
+// Adds a work directory private to this run, where its FFmpeg writes. FFmpeg survives a SIGKILL of agvid and can keep
+// writing after the next run reclaims the lock, so finished files are moved into place only once this run's FFmpeg has
+// exited. Work directories left by killed runs are removed; an orphan writing there affects no other run.
+async function workspace(output) {
+  const { directory } = output;
+  const names = await readdir(directory).catch(() => []);
+  await Promise.all(names.filter((name) => name.startsWith(WORK))
+    .map((name) => rm(path.join(directory, name), { recursive: true, force: true, maxRetries: 3 }).catch(() => {})));
+  const work = path.join(directory, `${WORK}${randomUUID()}`);
+  try { await mkdir(work); }
+  catch (error) { await release(output, []); throw error; }
+  return { ...output, work };
+}
+
+// Returns the claimed output directory: { directory, lock, work, created, firstParent }.
 async function outputDirectory(video, command, requested) {
   if (requested) {
     const directory = path.resolve(requested);
@@ -555,7 +571,7 @@ async function outputDirectory(video, command, requested) {
       await rm(lock, { force: true });
       throw new Error(`output directory is not empty: ${directory}`);
     }
-    return { directory, lock, created, firstParent: created ? firstParent : undefined };
+    return workspace({ directory, lock, created, firstParent: created ? firstParent : undefined });
   }
   const agvid = path.join(await findProjectRoot(process.cwd()), '.agvid');
   const root = path.join(agvid, 'runs');
@@ -575,12 +591,13 @@ async function outputDirectory(video, command, requested) {
       if (error.code === 'EEXIST') continue;
       throw error;
     }
-    return { directory, lock: await claim(directory), created: true };
+    return workspace({ directory, lock: await claim(directory), created: true });
   }
 }
 
 // Deletes this run's files, then its lock, then the directory and parents it created if nothing else is in them.
-async function release({ directory, lock, created, firstParent }, produced) {
+async function release({ directory, lock, work, created, firstParent }, produced) {
+  if (work) await rm(work, { recursive: true, force: true }).catch(() => {});
   await Promise.all(produced.map((file) => rm(file, { force: true }).catch(() => {})));
   await rm(lock, { force: true }).catch(() => {});
   if (created) await rmdir(directory).then(() => removeParents(directory, firstParent)).catch(() => {});
@@ -1001,7 +1018,7 @@ async function execute({ command, video, videos, options }) {
     if (times.length > 240) throw new Error('frame would create over 240 frames; reduce --at values');
   }
   const output = await outputDirectory(video, command, options.output);
-  const { directory } = output;
+  const { directory, work } = output;
   const frames = [];
   const produced = [];
   // Shared by every position that finds no frame, including concurrent ones.
@@ -1009,7 +1026,7 @@ async function execute({ command, video, videos, options }) {
   const extractFrame = async (time, i) => {
     const timecode = formatTimecode(time);
     const filename = `frame-${String(i).padStart(4, '0')}_${timecode.replaceAll(':', '-')}.jpg`;
-    const target = path.join(directory, filename);
+    const target = path.join(work, filename);
     produced.push(target);
     let extractionError;
     try { await extract(video, info, time, width, target, crop); }
@@ -1028,7 +1045,7 @@ async function execute({ command, video, videos, options }) {
     if (scores) frames.forEach((frame, i) => { frame.score = scores[i]; });
     let sheets;
     if (command !== 'frame' || frames.length > 1) {
-      const size = await frameSize(path.join(directory, frames[0].file));
+      const size = await frameSize(path.join(work, frames[0].file));
       sheets = [];
       const slices = windows ?? [{ frames: [0, frames.length - 1] }];
       const plans = slices.map((slice) => {
@@ -1040,16 +1057,21 @@ async function execute({ command, video, videos, options }) {
       const digits = Math.max(2, String(plans.length).length);
       for (const [i, { slice, first, last, layout }] of plans.entries()) {
         const file = `sheet-${String(i + 1).padStart(digits, '0')}.jpg`;
-        produced.push(path.join(directory, file));
-        await writeSheet(directory, frames.slice(first, last + 1), file, layout, produced);
+        produced.push(path.join(work, file));
+        await writeSheet(work, frames.slice(first, last + 1), file, layout, produced);
         sheets.push({ file, frames: [first, last], start: frames[first].time, end: frames[last].time, ...layout });
         (slice.sheets ??= []).push(file);
       }
     }
     // No FFmpeg runs past here, so honor a cancellation that arrived during the last steps before committing.
     if (cancelled) throw cancellationError();
+    for (const file of [...frames.map((frame) => frame.file), ...(sheets ?? []).map((sheet) => sheet.file)]) {
+      produced.push(path.join(directory, file));
+      await rename(path.join(work, file), path.join(directory, file));
+    }
     produced.push(path.join(directory, 'manifest.json.tmp'), path.join(directory, 'manifest.json'));
     const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, ...(crop ? { crop } : {}), ...(range && (options.start !== undefined || options.end !== undefined) ? { range } : {}), ...(detection ? { detection } : {}), frames, ...(windows ? { windows } : {}), ...(sheets ? { sheets } : {}) });
+    await rm(work, { recursive: true, force: true });
     await rm(output.lock, { force: true });
     console.log(JSON.stringify({ directory, ...(sheets ? { sheets: sheets.map((sheet) => path.join(directory, sheet.file)) } : {}), manifest, frames: frames.length, ...(detection ? { changes: frames.length - 1 } : {}) }, null, 2));
   } catch (error) {

@@ -1309,9 +1309,11 @@ exec "${real}" "$@"
   };
 }
 
+// Also looks in a run's work directory, where images stay until the run completes.
 async function hasImage(directory) {
   for (const name of await readdir(directory).catch(() => [])) {
-    if (name.endsWith('.jpg') && (await stat(path.join(directory, name))).size > 0) return true;
+    if (name.startsWith('.agvid.lock.work-') && await hasImage(path.join(directory, name))) return true;
+    if (name.endsWith('.jpg') && (await stat(path.join(directory, name)).catch(() => ({ size: 0 }))).size > 0) return true;
   }
   return false;
 }
@@ -1699,5 +1701,28 @@ syncBuiltinESMExports();
       a.kill('SIGKILL');
       await aExited;
     }
+  });
+});
+
+test('FFmpeg left running by a killed run cannot write into the run that reclaims its directory', async () => {
+  await withTempDirectory(async (directory) => {
+    const output = path.join(directory, 'out');
+    await mkdir(output);
+    const gate = await gatedFfmpeg(directory);
+    await gate.reset();
+    const killed = launch({ env: gate.env() }, 'frame', video, '--at', '1', '--width', '64', '--output', output);
+    await until(async () => (await gate.pids()).length === 1, 'the killed run extracting');
+    const [orphan] = await gate.pids();
+    killed.child.kill('SIGKILL');
+    await killed.exited;
+    // Its FFmpeg survives; the next run reclaims the directory and finishes first.
+    const result = await launch({ env: gate.env({ PASS: '2' }) }, 'frame', video, '--at', '1', '--width', '160', '--output', output).exited;
+    assert.equal(result.code, 0, result.stderr);
+    await gate.release();
+    await until(() => { try { process.kill(orphan, 0); return false; } catch { return true; } }, 'the orphaned FFmpeg to exit');
+    const manifest = JSON.parse(await readFile(path.join(output, 'manifest.json'), 'utf8'));
+    assert.equal(manifest.outputWidth, 160);
+    assert.equal(jpegInfo(path.join(output, manifest.frames[0].file)).width, 160);
+    assert.deepEqual((await readdir(output)).sort(), [manifest.frames[0].file, 'manifest.json']);
   });
 });
