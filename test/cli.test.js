@@ -1479,6 +1479,125 @@ syncBuiltinESMExports();
   });
 });
 
+test('stale guard recovery cannot displace a live reclaimer while it checks the stale lock', async () => {
+  await withTempDirectory(async (directory) => {
+    const output = path.join(directory, 'out');
+    const sync = path.join(directory, 'hold');
+    const lock = path.join(output, '.agvid.lock');
+    const guard = `${lock}.reclaim`;
+    await mkdir(output);
+    await mkdir(sync);
+    const dead = spawnSync(process.execPath, ['-e', '']).pid;
+    const stale = `${dead}\n${os.hostname()}\n`;
+    const hook = path.join(directory, 'hook.mjs');
+    await writeFile(hook, `import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+const root = ${JSON.stringify(sync)};
+const step = async (signal, wait) => {
+  fs.writeFileSync(root + '/' + signal, '');
+  while (!fs.existsSync(root + '/' + wait)) await new Promise((resolve) => setTimeout(resolve, 10));
+};
+const open = fs.promises.open;
+fs.promises.open = async (file, ...rest) => {
+  const handle = await open(file, ...rest);
+  const read = handle.readFile.bind(handle);
+  handle.readFile = async (...args) => {
+    const content = await read(...args);
+    if (process.env.ROLE === 'A' && String(file).includes('.agvid.lock.reclaim')) await step('A-read', 'A-resume');
+    if (process.env.ROLE === 'B' && String(file).endsWith('.agvid.lock')) await step('B-read', 'B-resume');
+    return content;
+  };
+  return handle;
+};
+const rename = fs.promises.rename;
+fs.promises.rename = async (from, to) => {
+  await rename(from, to);
+  if (process.env.ROLE === 'A' && String(from).endsWith('.reclaim')) await step('A-moved', 'A-finish');
+};
+const rmdir = fs.promises.rmdir;
+let heldEmpty = false;
+fs.promises.rmdir = async (file, ...rest) => {
+  if (process.env.ROLE === 'A' && process.env.FORMAT === 'empty' && String(file).endsWith('.reclaim') && !heldEmpty) {
+    heldEmpty = true;
+    await step('A-read', 'A-resume');
+  }
+  return rmdir(file, ...rest);
+};
+const mkdir = fs.promises.mkdir;
+fs.promises.mkdir = async (file, ...rest) => {
+  const result = await mkdir(file, ...rest);
+  if (process.env.ROLE === 'A' && process.env.FORMAT === 'publishing' && String(file).endsWith('.reclaim')) await step('A-read', 'A-resume');
+  return result;
+};
+syncBuiltinESMExports();
+`);
+    const gate = await gatedFfmpeg(directory);
+    // Also cover a creator resuming after its empty directory was recovered, before it published its owner file.
+    for (const format of ['file', 'directory', 'empty', 'publishing']) {
+      await rm(sync, { recursive: true, force: true });
+      await mkdir(sync);
+      await gate.reset();
+      await writeFile(lock, stale);
+      if (format === 'file') await writeFile(guard, stale);
+      else if (format !== 'publishing') {
+        await mkdir(guard);
+        if (format === 'directory') await writeFile(path.join(guard, '00000000-0000-4000-8000-000000000000'), stale);
+        else {
+          const old = new Date(Date.now() - 61000);
+          await utimes(guard, old, old);
+        }
+      }
+      const signaled = (name) => stat(path.join(sync, name)).then(() => true, () => false);
+      const runs = [];
+      const start = (role) => {
+        const run = launch({ env: gate.env({ ROLE: role, FORMAT: format, NODE_OPTIONS: `--import=${pathToFileURL(hook).href}` }) },
+          'frame', video, '--at', '1', '--width', '160', '--output', output);
+        runs.push(run);
+        return run;
+      };
+      try {
+        const a = start('A');
+        let aResult;
+        a.exited.then((result) => { aResult = result; });
+        await until(() => signaled('A-read'), `${format}: A reads the stale guard`);
+        if (format === 'publishing') {
+          const old = new Date(Date.now() - 61000);
+          await utimes(guard, old, old);
+        }
+        const b = start('B');
+        await until(() => signaled('B-read'), `${format}: B owns the replacement guard and reads the stale lock`);
+        await writeFile(path.join(sync, 'A-resume'), '');
+        await until(async () => aResult || await signaled('A-moved'), `${format}: A attempts recovery`);
+        const c = start('C');
+        let cResult;
+        c.exited.then((result) => { cResult = result; });
+        await until(async () => cResult || (await gate.pids()).length > 0, `${format}: C attempts to claim`);
+        assert.ok(cResult, `${format}: C acquired the directory while B held the reclaim guard`);
+        assert.notEqual(cResult.code, 0);
+        assert.match(cResult.stderr, /in use by another agvid run/);
+        await writeFile(path.join(sync, 'A-finish'), '');
+        assert.notEqual((await a.exited).code, 0);
+        await writeFile(path.join(sync, 'B-resume'), '');
+        await until(async () => (await gate.pids()).length === 1, `${format}: B extracts alone`);
+        assert.equal((await readFile(lock, 'utf8')).split('\n')[0], String(b.child.pid));
+        await gate.release();
+        const result = await b.exited;
+        assert.equal(result.code, 0, result.stderr);
+        const manifest = JSON.parse(await readFile(path.join(output, 'manifest.json'), 'utf8'));
+        assert.deepEqual(manifest.frames.map(({ time }) => time), [1]);
+        jpegInfo(path.join(output, manifest.frames[0].file));
+        assert.deepEqual((await readdir(output)).sort(), [manifest.frames[0].file, 'manifest.json'].sort());
+      } finally {
+        await gate.release();
+        for (const run of runs) run.child.kill('SIGKILL');
+        await Promise.all(runs.map((run) => run.exited));
+      }
+      await rm(output, { recursive: true, force: true });
+      await mkdir(output);
+    }
+  });
+});
+
 test('a reclaim guard left by a run killed while reclaiming is recovered by the next run', async () => {
   await withTempDirectory(async (directory) => {
     const output = path.join(directory, 'out');
@@ -1493,7 +1612,10 @@ test('a reclaim guard left by a run killed while reclaiming is recovered by the 
 import { syncBuiltinESMExports } from 'node:module';
 const open = fs.promises.open;
 fs.promises.open = async (file, ...rest) => {
-  if (String(file).endsWith('.agvid.lock')) { fs.writeFileSync(${JSON.stringify(path.join(sync, 'guarded'))}, ''); await new Promise(() => {}); }
+  if (String(file).endsWith('.agvid.lock')) {
+    fs.writeFileSync(${JSON.stringify(path.join(sync, 'guarded'))}, '');
+    await new Promise(() => { setInterval(() => {}, 1000); });
+  }
   return open(file, ...rest);
 };
 syncBuiltinESMExports();

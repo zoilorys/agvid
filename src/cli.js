@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { link, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { mkdir, open, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -407,10 +408,10 @@ const LOCK = '.agvid.lock';
 
 // Claims `directory` for this run with an exclusively created lock file holding its pid and host. An emptiness check
 // alone lets two runs share an existing empty directory; whichever creates the lock first owns it. A lock left by a
-// killed run on this host is replaced under an exclusively created LOCK.reclaim guard. A stale lock's owner is gone and
-// other runs need the guard to remove it, so the lock this run read as stale is still the one it removes. A lock found
-// missing is never removed: a run that does not take the guard may have created it since. A guard left by a run killed
-// while holding it is removed by the next run that needs it, or that claims the directory.
+// killed run on this host is replaced under a LOCK.reclaim directory containing a unique owner file. Recovery can
+// unlink a dead owner's specific file, but rmdir cannot remove a directory containing a live owner's file. A stale
+// lock's owner is gone and other runs need the guard to remove it, so the lock read as stale is still the one removed.
+// A lock found missing is never removed: a run that does not take the guard may have created it since.
 async function claim(directory) {
   const lock = path.join(directory, LOCK);
   const guard = `${lock}.reclaim`;
@@ -418,44 +419,89 @@ async function claim(directory) {
   const create = (file) => writeFile(file, owner, { flag: 'wx' }).then(() => true,
     (error) => { if (error.code === 'EEXIST') return false; throw error; });
   if (await create(lock)) {
-    await removeStale(guard).catch(() => {});
+    await recoverGuard(guard).catch(() => {});
     return lock;
   }
-  if (await create(guard) || (await removeStale(guard) && await create(guard))) {
+  const releaseGuard = await acquireGuard(guard, owner) || (await recoverGuard(guard) && await acquireGuard(guard, owner));
+  if (releaseGuard) {
     try {
       const { state } = await readOwner(lock);
       if (state === 'stale') await rm(lock, { force: true });
       if (state !== 'held' && await create(lock)) return lock;
-    } finally { await rm(guard, { force: true }); }
+    } finally { await releaseGuard(); }
   }
   throw Object.assign(new Error(`output directory is in use by another agvid run: ${directory} (delete ${LOCK} if no run is active)`), { inUse: true });
 }
 
-// Reads a lock file through one descriptor: its identity and its owner's state, 'missing', 'stale' or 'held'.
+// Reads a lock file through one descriptor: its owner's state, 'missing', 'stale' or 'held'.
 async function readOwner(file) {
   let handle;
   try { handle = await open(file, 'r'); }
   catch (error) { if (error.code === 'ENOENT') return { state: 'missing' }; throw error; }
   try {
     const info = await handle.stat();
-    return { identity: `${info.dev}:${info.ino}`, state: ownerState(await handle.readFile('utf8'), info.mtimeMs) };
+    return { state: ownerState(await handle.readFile('utf8'), info.mtimeMs) };
   } finally { await handle.close(); }
 }
 
-// Removes a lock file whose owner is gone and returns whether none is left. The file read is moved aside and checked to
-// be that same file; if another run replaced it meanwhile, the replacement is moved back. That fails only if a third
-// run created the name in the instants it was aside, so this is kept to guards, which exist for microseconds.
-async function removeStale(file) {
-  const { identity, state } = await readOwner(file);
-  if (state !== 'stale') return state === 'missing';
-  const aside = `${file}.${process.pid}`;
-  try { await rename(file, aside); }
+async function acquireGuard(directory, owner) {
+  try { await mkdir(directory); }
+  catch (error) { if (error.code === 'EEXIST') return undefined; throw error; }
+  const token = randomUUID();
+  const file = path.join(directory, token);
+  const release = async () => {
+    await unlink(file).catch((error) => { if (error.code !== 'ENOENT') throw error; });
+    await rmdir(directory).catch((error) => { if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error; });
+  };
+  try {
+    await writeFile(file, owner, { flag: 'wx' });
+    // An empty guard may have been recovered and recreated between mkdir and writeFile. Only the sole owner may
+    // proceed. Its unique file keeps the directory nonempty until release; later arrivals see it and cannot win.
+    const files = await readdir(directory);
+    if (files.length === 1 && files[0] === token) return release;
+  } catch (error) {
+    if (error.code !== 'ENOENT') { await release(); throw error; }
+  }
+  await release();
+}
+
+async function recoverGuard(directory) {
+  let info;
+  try { info = await stat(directory); }
   catch (error) { if (error.code === 'ENOENT') return true; throw error; }
-  const moved = await stat(aside);
-  const same = `${moved.dev}:${moved.ino}` === identity;
-  if (!same) await link(aside, file).catch(() => {});
-  await rm(aside, { force: true });
-  return same;
+  if (!info.isDirectory()) {
+    // Older releases used a guard file. unlink cannot move or delete a replacement guard directory.
+    const { state } = await readOwner(directory).catch((error) => {
+      if (error.code === 'EISDIR') return { state: 'held' };
+      throw error;
+    });
+    if (state !== 'stale') return state === 'missing';
+    try { await unlink(directory); return true; }
+    catch (error) {
+      if (error.code === 'ENOENT') return true;
+      if (['EISDIR', 'EPERM'].includes(error.code)) return false;
+      throw error;
+    }
+  }
+  let files;
+  try { files = await readdir(directory); }
+  catch (error) { if (error.code === 'ENOENT') return true; throw error; }
+  // Allow a creator time to write its owner file. Recovery after that remains safe even if it resumes later.
+  if (!files.length && Date.now() - info.mtimeMs < 60000) return false;
+  for (const name of files) {
+    if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(name)) return false;
+    const file = path.join(directory, name);
+    const { state } = await readOwner(file);
+    if (state === 'held') return false;
+    // Owner filenames are never reused. A delayed recovery cannot unlink a newer owner's file.
+    if (state === 'stale') await unlink(file).catch((error) => { if (error.code !== 'ENOENT') throw error; });
+  }
+  try { await rmdir(directory); return true; }
+  catch (error) {
+    if (error.code === 'ENOENT') return true;
+    if (['ENOTEMPTY', 'EEXIST'].includes(error.code)) return false;
+    throw error;
+  }
 }
 
 // 'stale' when written on this host by a process that no longer exists, else 'held'. Lock files from other hosts
