@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises';
+import { spawn, spawnSync } from 'node:child_process';
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { formatTimecode } from '../src/cli.js';
@@ -633,7 +633,7 @@ test('changes detects a color swap with nearly unchanged grayscale brightness', 
     const manifest = await changesManifest(output);
     assert.equal(output.changes, 1);
     assert.ok(Math.abs(manifest.frames[1].time - 1) <= 0.04, String(manifest.frames[1].time));
-    assert.match(manifest.detection.metric, /RGB any-channel-diff>16@256px,30fps/);
+    assert.match(manifest.detection.metric, /RGB any-channel-diff>16@256x\d+px,30fps/);
   });
 });
 
@@ -1213,7 +1213,7 @@ test('tail positions share one last-frame lookup, and an unusable lookup keeps t
     await mkdir(bin);
     // Logs tail lookups; with EMPTY set they list no packets, like a source without usable timestamps.
     await writeFile(path.join(bin, 'ffprobe'), `#!/bin/sh
-case " $* " in *" -show_entries packet=pts:stream=time_base "*) echo x >> "${calls}"; [ -n "$EMPTY" ] && exit 0;; esac
+case " $* " in *" -show_entries packet=pts,dts,duration:stream=time_base "*) echo x >> "${calls}"; [ -n "$EMPTY" ] && exit 0;; esac
 exec "${real}" "$@"
 `);
     await chmod(path.join(bin, 'ffprobe'), 0o755);
@@ -1229,5 +1229,153 @@ exec "${real}" "$@"
     assert.match(failed.stderr, /ffmpeg exited/);
     assert.doesNotMatch(failed.stderr, /Infinity|NaN/);
     assert.deepEqual((await readdir(directory)).sort(), ['bin', 'calls', 'one-fps.mp4', 'overview']);
+  });
+});
+
+test('changes on a narrow full-height crop bounds analysis pixels and still finds the change', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'tall.mp4');
+    ffmpeg('-f', 'lavfi', '-i', "color=black:size=160x2160:rate=10:duration=2,drawbox=x=0:y=1000:w=16:h=200:color=white:t=fill:enable='gte(t,1)'",
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', source);
+    // A 16x2160 crop at the default 256 px analysis width would be 256x34560.
+    const output = success('changes', source, '--crop', '0,0,0.1,1', '--output', path.join(directory, 'out'));
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    const { width, height } = manifest.detection.analysis;
+    assert.ok(width * height <= 512 * 512, `${width}x${height}`);
+    assert.ok(Math.abs(height / width / (2160 / 16) - 1) < 0.05, `${width}x${height}`);
+    assert.deepEqual(manifest.frames.map(({ time }) => time), [0, 1]);
+    assert.ok(manifest.frames[1].score > 0.05, String(manifest.frames[1].score));
+  });
+});
+
+// Starts the CLI without waiting for it; `exited` resolves with its exit code and output.
+function launch(options, ...args) {
+  const child = spawn(process.execPath, [cli, ...args], { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  return { child, exited: new Promise((resolve) => child.on('close', (code, signal) => resolve({ code, signal, stdout, stderr }))) };
+}
+
+// Polls observable state, so concurrency tests wait on what processes did rather than on fixed delays.
+async function until(check, what) {
+  for (let i = 0; i < 2000; i++) {
+    if (await check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
+// An ffmpeg wrapper that records each frame extraction (-frames:v 1) as sync/call-N/<pid>. Calls after the first PASS
+// wait for sync/release and then run real FFmpeg, or fail with FAIL set (or after about 30 s, so a regression cannot
+// leave them waiting). Other calls run FFmpeg directly.
+async function gatedFfmpeg(directory) {
+  const real = spawnSync('sh', ['-c', 'command -v ffmpeg'], { encoding: 'utf8' }).stdout.trim();
+  const bin = path.join(directory, 'gate');
+  const sync = path.join(directory, 'sync');
+  await mkdir(bin);
+  await writeFile(path.join(bin, 'ffmpeg'), `#!/bin/sh
+case " $* " in *" -frames:v 1 "*) ;; *) exec "${real}" "$@";; esac
+n=1; while ! mkdir "${sync}/call-$n" 2>/dev/null; do n=$((n+1)); done
+touch "${sync}/call-$n/$$"
+if [ "$n" -gt "\${PASS:-0}" ]; then
+  i=0; while [ ! -e "${sync}/release" ]; do i=$((i+1)); [ "$i" -gt 3000 ] && exit 1; sleep 0.01; done
+  [ -n "$FAIL" ] && exit 1
+fi
+exec "${real}" "$@"
+`);
+  await chmod(path.join(bin, 'ffmpeg'), 0o755);
+  const pids = async () => (await Promise.all((await readdir(sync)).filter((name) => name.startsWith('call-'))
+    .map((name) => readdir(path.join(sync, name))))).flat().map(Number);
+  return {
+    env: (extra) => ({ ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}`, ...extra }),
+    reset: async () => { await rm(sync, { recursive: true, force: true }); await mkdir(sync); },
+    release: () => writeFile(path.join(sync, 'release'), ''),
+    pids,
+  };
+}
+
+async function hasImage(directory) {
+  for (const name of await readdir(directory).catch(() => [])) {
+    if (name.endsWith('.jpg') && (await stat(path.join(directory, name))).size > 0) return true;
+  }
+  return false;
+}
+
+test('one of two runs sharing an explicit output directory owns it; the other leaves its files alone', async () => {
+  await withTempDirectory(async (directory) => {
+    const [black, white] = ['black', 'white'].map((color) => path.join(directory, `${color}.mp4`));
+    for (const [file, color] of [[black, 'black'], [white, 'white']]) {
+      ffmpeg('-f', 'lavfi', '-i', `color=${color}:size=64x48:rate=10:duration=1`, '-pix_fmt', 'yuv420p', file);
+    }
+    const gate = await gatedFfmpeg(directory);
+    const shared = path.join(directory, 'shared');
+    for (const [existing, fail] of [[false, false], [true, false], [false, true], [true, true]]) {
+      const label = `existing=${existing} fail=${fail}`;
+      await gate.reset();
+      await rm(shared, { recursive: true, force: true });
+      if (existing) await mkdir(shared);
+      // The owner's first extraction completes and its second waits, so it holds a written image when the rival starts.
+      const owner = launch({ env: gate.env({ PASS: '1', ...(fail ? { FAIL: '1' } : {}) }) }, 'frame', black, '--at', '0,0.5', '--output', shared);
+      await until(async () => (await gate.pids()).length >= 2 && hasImage(shared), `owner extraction (${label})`);
+      const held = (await readdir(shared)).sort();
+      const rival = invoke('frame', white, '--at', '0,0.5', '--output', shared);
+      assert.notEqual(rival.status, 0, label);
+      assert.match(rival.stderr, /in use by another agvid run/, label);
+      assert.deepEqual((await readdir(shared)).sort(), held, label);
+      await gate.release();
+      const result = await owner.exited;
+      if (fail) {
+        assert.notEqual(result.code, 0, label);
+        if (existing) assert.deepEqual(await readdir(shared), [], label);
+        else assert.ok(!(await readdir(directory)).includes('shared'), label);
+        continue;
+      }
+      assert.equal(result.code, 0, result.stderr);
+      const manifest = JSON.parse(await readFile(path.join(shared, 'manifest.json'), 'utf8'));
+      assert.equal(manifest.source.video, black, label);
+      assert.deepEqual((await readdir(shared)).sort(), [...manifest.frames.map(({ file }) => file), 'manifest.json', 'sheet-01.jpg'].sort(), label);
+      for (const { file } of manifest.frames) assert.ok(halves(path.join(shared, file)).every((mean) => mean < 5), `${label} ${file}`);
+    }
+  });
+});
+
+test('concurrent runs with default output each claim their own directory', async () => {
+  await withTempDirectory(async (directory) => {
+    const cwd = await realpath(directory);
+    const gate = await gatedFfmpeg(cwd);
+    await gate.reset();
+    const runs = [0, 1].map(() => launch({ cwd, env: gate.env() }, 'frame', video, '--at', '1'));
+    await until(async () => (await gate.pids()).length === 2, 'both extractions');
+    await gate.release();
+    const results = await Promise.all(runs.map((run) => run.exited));
+    const directories = results.map((result) => {
+      assert.equal(result.code, 0, result.stderr);
+      return JSON.parse(result.stdout).directory;
+    });
+    assert.notEqual(directories[0], directories[1]);
+    for (const output of directories) assert.deepEqual((await readdir(output)).sort(), ['frame-0000_00-01.000.jpg', 'manifest.json']);
+  });
+});
+
+test('SIGTERM stops FFmpeg, removes the incomplete run and releases its directory', async () => {
+  await withTempDirectory(async (directory) => {
+    const gate = await gatedFfmpeg(directory);
+    const output = path.join(directory, 'out');
+    for (const existing of [false, true]) {
+      await gate.reset();
+      if (existing) await mkdir(output);
+      const run = launch({ env: gate.env({ PASS: '1' }) }, 'overview', video, '--frames', '3', '--width', '160', '--output', output);
+      await until(async () => (await gate.pids()).length >= 2 && hasImage(output), 'one written image and one held extraction');
+      run.child.kill('SIGTERM');
+      const result = await run.exited;
+      assert.equal(result.code, 143, result.stderr);
+      assert.match(result.stderr, /cancelled by SIGTERM/);
+      // Every FFmpeg (or its waiting wrapper) is gone, so nothing can write after cleanup.
+      for (const pid of await gate.pids()) assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' }, `pid ${pid}`);
+      if (existing) assert.deepEqual(await readdir(output), []);
+      else assert.ok(!(await readdir(directory)).includes('out'));
+    }
   });
 });
