@@ -1637,7 +1637,7 @@ test('an empty lock is held while fresh and reclaimed once a minute old', async 
     const output = path.join(directory, 'out');
     const lock = path.join(output, '.agvid.lock');
     await mkdir(output);
-    // A run killed between creating the lock and writing its pid leaves it empty.
+    // An older release, or one on a filesystem without hard links, killed between creating the lock and writing its pid.
     await writeFile(lock, '');
     const fresh = invoke('frame', video, '--at', '1', '--output', output);
     assert.match(fresh.stderr, /in use by another agvid run/);
@@ -1646,5 +1646,58 @@ test('an empty lock is held while fresh and reclaimed once a minute old', async 
     const result = invoke('frame', video, '--at', '1', '--output', output);
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual((await readdir(output)).sort(), ['frame-0000_00-01.000.jpg', 'manifest.json']);
+  });
+});
+
+test('a run stalled for over a minute while claiming a directory never shares it with a run that claimed it meanwhile', async () => {
+  await withTempDirectory(async (directory) => {
+    const output = path.join(directory, 'out');
+    const sync = path.join(directory, 'hold');
+    await mkdir(output);
+    await mkdir(sync);
+    // A's exclusive creation of its lock file pauses between creating the file and writing its owner.
+    const hook = path.join(directory, 'hook.mjs');
+    await writeFile(hook, `import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+const root = ${JSON.stringify(sync)};
+const writeFile = fs.promises.writeFile;
+fs.promises.writeFile = async (file, data, options) => {
+  if (!String(file).startsWith(${JSON.stringify(path.join(output, '.agvid.lock'))}) || options?.flag !== 'wx') return writeFile(file, data, options);
+  const handle = await fs.promises.open(file, 'wx');
+  fs.writeFileSync(root + '/created', String(file));
+  while (!fs.existsSync(root + '/resume')) await new Promise((resolve) => setTimeout(resolve, 10));
+  try { await handle.writeFile(data); } finally { await handle.close(); }
+};
+syncBuiltinESMExports();
+`);
+    const gate = await gatedFfmpeg(directory);
+    await gate.reset();
+    const a = spawn(process.execPath, ['--import', pathToFileURL(hook).href, cli, 'frame', video, '--at', '1', '--output', output],
+      { env: gate.env(), stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    a.stderr.on('data', (chunk) => { stderr += chunk; });
+    let aCode;
+    const aExited = new Promise((resolve) => a.on('close', (code) => resolve(aCode = code)));
+    try {
+      await until(() => stat(path.join(sync, 'created')).then(() => true, () => false), 'A creating its lock');
+      const old = new Date(Date.now() - 61000);
+      const created = await readFile(path.join(sync, 'created'), 'utf8');
+      await utimes(created, old, old);
+      const b = launch({ env: gate.env() }, 'frame', video, '--at', '1', '--output', output);
+      await until(async () => (await gate.pids()).length === 1, 'B extracting');
+      await writeFile(path.join(sync, 'resume'), '');
+      await until(async () => aCode !== undefined || (await gate.pids()).length > 1, 'A resuming');
+      assert.notEqual(aCode, undefined, 'A extracted into the directory B owns');
+      assert.notEqual(aCode, 0);
+      assert.match(stderr, /in use by another agvid run/);
+      await gate.release();
+      const result = await b.exited;
+      assert.equal(result.code, 0, result.stderr);
+      assert.deepEqual((await readdir(output)).sort(), ['frame-0000_00-01.000.jpg', 'manifest.json']);
+    } finally {
+      await gate.release();
+      a.kill('SIGKILL');
+      await aExited;
+    }
   });
 });

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
+import { link, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -416,8 +416,7 @@ async function claim(directory) {
   const lock = path.join(directory, LOCK);
   const guard = `${lock}.reclaim`;
   const owner = `${process.pid}\n${os.hostname()}\n`;
-  const create = (file) => writeFile(file, owner, { flag: 'wx' }).then(() => true,
-    (error) => { if (error.code === 'EEXIST') return false; throw error; });
+  const create = (file) => publish(file, owner, `${lock}.${randomUUID()}`);
   if (await create(lock)) {
     await recoverGuard(guard).catch(() => {});
     return lock;
@@ -431,6 +430,22 @@ async function claim(directory) {
     } finally { await releaseGuard(); }
   }
   throw Object.assign(new Error(`output directory is in use by another agvid run: ${directory} (delete ${LOCK} if no run is active)`), { inUse: true });
+}
+
+// Creates `file` holding `content` unless it exists. The content is written to `staging` first and hard-linked into
+// place, so `file` never appears empty: a run stalled before writing cannot have its lock mistaken for a killed run's
+// and replaced, then carry on alongside the replacement. Filesystems without hard links fall back to exclusive creation.
+async function publish(file, content, staging) {
+  await writeFile(staging, content, { flag: 'wx' });
+  try {
+    await link(staging, file);
+    return true;
+  } catch (error) {
+    if (error.code === 'EEXIST') return false;
+    if (!['EPERM', 'ENOTSUP', 'ENOSYS'].includes(error.code)) throw error;
+    return writeFile(file, content, { flag: 'wx' }).then(() => true,
+      (error) => { if (error.code === 'EEXIST') return false; throw error; });
+  } finally { await unlink(staging).catch(() => {}); }
 }
 
 // Reads a lock file through one descriptor: its owner's state, 'missing', 'stale' or 'held'.
@@ -454,7 +469,7 @@ async function acquireGuard(directory, owner) {
     await rmdir(directory).catch((error) => { if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error; });
   };
   try {
-    await writeFile(file, owner, { flag: 'wx' });
+    await publish(file, owner, `${directory}.${token}`);
     // An empty guard may have been recovered and recreated between mkdir and writeFile. Only the sole owner may
     // proceed. Its unique file keeps the directory nonempty until release; later arrivals see it and cannot win.
     const files = await readdir(directory);
@@ -505,8 +520,8 @@ async function recoverGuard(directory) {
 }
 
 // 'stale' when written on this host by a process that no longer exists, else 'held'. Lock files from other hosts
-// (shared or container mounts), or unreadable ones, count as held. A run writes its pid right after creating the file,
-// so one still empty after a minute belongs to a run killed in between.
+// (shared or container mounts), or unreadable ones, count as held. Only older releases, or filesystems without hard
+// links, create a lock before writing its pid, so one still empty after a minute belongs to a run killed in between.
 function ownerState(content, modified) {
   if (!content) return Date.now() - modified > 60000 ? 'stale' : 'held';
   const [pid, host] = content.split('\n');
