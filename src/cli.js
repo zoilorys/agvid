@@ -17,16 +17,20 @@ Commands:
 each --around gets its own window and sheets (manifest windows[]). Up to 240 frames.
 changes writes the range start plus each frame where over --threshold (default 0.002) of the
 picture differs in any RGB channel from the last detected candidate, at least --min-gap (default 0.5s) apart;
---max (default 48, up to 240) keeps the highest scores. It decodes the whole range (sampled
+--max (default 48, up to 239 plus the range start) keeps the highest scores. It decodes the whole range (sampled
 up to 30 fps at 256px wide by default). --analysis-fps (1-60) and --analysis-width (64-512)
 tune detection cost and sensitivity. Use --start/--end on long videos. Needs FFmpeg 5.1+. --crop limits detection
 to the region; use it for small UI changes.
 TIME accepts seconds, MM:SS.s, or HH:MM:SS.s; clock minute and second fields must be below 60.
 DURATION accepts seconds, with optional s suffix. Manifest times keep sub-millisecond precision;
 filenames and sheet labels round to milliseconds.
---end is clamped to the video duration. --start/--end cannot combine with --around/--window.
+Times are on the container timeline (0 is the container start, as in players and ffmpeg -ss); probe start/end
+give the selected video stream's span on it, which may begin after 0. --start/--end are clamped to that span;
+--at and --around must fall inside it. A time between frames shows the next frame, or the last one at the end.
+--start/--end cannot combine with --around/--window.
 --crop takes fractions 0-1 of the displayed frame (left, top, width, height) and cuts
-that region at source resolution before --width scaling; it is never enlarged.
+that region at source resolution before --width scaling. Output is capped at the displayed width
+(square pixels: SAR applied to the coded horizontal axis, then rotated).
 --window is the total duration centered on --around. Options also accept --key=value.
 --video-stream N selects the zero-based video stream (0:v:N), default 0, on every command.
 Writes JPEG frames and manifest.json; overview, inspect and changes also write
@@ -44,6 +48,8 @@ const OPTIONS = {
 };
 
 const MULTI = new Set(['at', 'around']);
+// Internal demuxer metadata controls seeking; symbol keys stay out of probe JSON and manifests.
+const SOURCE_FORMAT = Symbol('sourceFormat');
 
 export function parseTime(value) {
   const parts = String(value).replace(/s$/, '').split(':');
@@ -80,18 +86,18 @@ function videoStreamOption(value) {
   return Number(value);
 }
 
-// Resolves optional --start/--end to { start, end } seconds within the video; end is clamped to the duration.
+// Resolves optional --start/--end to { start, end } seconds within the video's span on the container timeline.
 export function resolveRange(options, info) {
-  const start = options.start === undefined ? 0 : parseTime(options.start);
-  const end = options.end === undefined ? info.duration : Math.min(info.duration, parseTime(options.end));
-  if (start >= info.duration) throw new Error(`--start ${formatTimecode(start)} must be before the video ends`);
+  const start = options.start === undefined ? info.start : Math.max(info.start, parseTime(options.start));
+  const end = options.end === undefined ? info.end : Math.min(info.end, parseTime(options.end));
+  if (start >= info.end) throw new Error(`--start ${formatTimecode(start)} must be before the video ends`);
   if (start >= end) throw new Error(`--start ${formatTimecode(start)} must be before --end ${formatTimecode(end)}`);
   return { start, end };
 }
 
 // Parses --crop fractions and maps them to even pixel offsets and sizes in the source's displayed orientation.
-// FFmpeg auto-rotates before -vf. SAR stretches only the displayed horizontal axis, uniformly, so equal fractions
-// of stored pixels still name the displayed region; `displayed` is that region's size in square pixels.
+// FFmpeg auto-rotates before -vf. SAR stretches one displayed axis uniformly, so equal fractions of stored pixels
+// still name the displayed region; `displayed` is that region's size in square pixels (see displayedSize).
 export function parseCrop(value, info) {
   const parts = String(value).split(',');
   const numbers = parts.map((part) => (/^\s*\d*\.?\d+\s*$/.test(part) ? Number(part) : NaN));
@@ -108,8 +114,17 @@ export function parseCrop(value, info) {
   const [px, width] = axis(x, w, info.width);
   const [py, height] = axis(y, h, info.height);
   if (width < 16 || height < 16) throw new Error(`--crop region is ${width}x${height} source pixels; it must be at least 16x16`);
-  const displayed = { width: Math.max(2, Math.round(width * (info.sar ?? 1))), height };
-  return { x, y, w, h, pixels: { x: px, y: py, width, height, displayed } };
+  return { x, y, w, h, pixels: { x: px, y: py, width, height, displayed: displayedSize(width, height, info) } };
+}
+
+// Square-pixel size of width x height stored pixels in displayed orientation. SAR scales the coded horizontal axis,
+// keeping the other at stored resolution; after a 90/270 turn that axis is displayed vertically. info.sar is
+// rotation-adjusted (inverted on a turn, as FFmpeg's transpose does), so dividing by it applies the coded SAR.
+export function displayedSize(width, height, info) {
+  const sar = info.sar ?? 1;
+  return info.rotation === 90 || info.rotation === 270
+    ? { width, height: Math.max(2, Math.round(height / sar)) }
+    : { width: Math.max(2, Math.round(width * sar)), height };
 }
 
 function parseArgs(args) {
@@ -159,22 +174,38 @@ function run(program, args) {
 
 async function probe(video, videoStream) {
   // Keep the full listing for audio presence and the container index of the selected video stream.
-  const raw = await run('ffprobe', ['-v', 'error', '-show_entries', 'stream=index,codec_type,width,height,avg_frame_rate,codec_name,duration,nb_frames,pix_fmt,bits_per_raw_sample,sample_aspect_ratio:stream_side_data=rotation:stream_tags=DURATION,rotate', '-of', 'json', video]);
-  const streams = JSON.parse(raw).streams ?? [];
+  const raw = await run('ffprobe', ['-v', 'error', '-show_entries', 'format=start_time,format_name:stream=index,codec_type,width,height,avg_frame_rate,codec_name,start_pts,start_time,time_base,duration_ts,duration,nb_frames,pix_fmt,bits_per_raw_sample,sample_aspect_ratio:stream_side_data=rotation:stream_tags=DURATION,rotate', '-of', 'json', video]);
+  const { streams = [], format = {} } = JSON.parse(raw);
   const videoStreams = streams.filter((entry) => entry.codec_type === 'video');
   const stream = videoStreams[videoStream];
   if (!stream) throw new Error(`video stream ${videoStream} not found (${videoStreams.length} video streams)`);
   const valid = (value) => Number.isFinite(value) && value > 0;
-  let duration = Number(stream.duration);
+  // FFmpeg seeks relative to the container's microsecond start time. Stream timestamps need their integer
+  // ticks: rounded start_time can fall after the actual first (and possibly only) frame.
+  const micros = (value) => (/^-?\d+(?:\.\d+)?$/.test(value ?? '') ? Math.round(Number(value) * 1e6) : NaN);
+  const containerMicros = Number.isFinite(micros(format.start_time)) ? micros(format.start_time) : 0;
+  const streamMicros = micros(stream.start_time);
+  const [timeNum, timeDen] = String(stream.time_base ?? '').split('/').map(Number);
+  const ticksToSeconds = (ticks) => Number.isSafeInteger(ticks) && Number.isSafeInteger(timeNum) && timeNum > 0
+    && Number.isSafeInteger(timeDen) && timeDen > 0
+    ? ticks * timeNum / timeDen : NaN;
+  const exactStart = ticksToSeconds(stream.start_pts);
+  let streamStart = Number.isFinite(exactStart) ? exactStart
+    : Number.isFinite(streamMicros) ? streamMicros / 1e6 : containerMicros / 1e6;
+  let duration = ticksToSeconds(stream.duration_ts);
+  if (!valid(duration)) duration = Number(stream.duration);
   let durationSource = 'stream';
+  // FFmpeg's Matroska muxer writes DURATION as the endpoint on the raw stream timeline, including any start offset.
   if (!valid(duration) && stream.tags?.DURATION) {
     durationSource = 'tag';
-    try { duration = parseTime(stream.tags.DURATION); }
+    try { duration = parseTime(stream.tags.DURATION) - streamStart; }
     catch { duration = NaN; }
   }
   if (!valid(duration)) {
     durationSource = 'packets';
-    duration = await packetDuration(video, videoStream);
+    const packets = await packetSpan(video, videoStream, ticksToSeconds);
+    duration = packets.end - packets.start;
+    if (Number.isFinite(packets.start)) streamStart = packets.start;
   }
   if (!valid(duration)) {
     throw new Error(`video stream ${videoStream} has no duration metadata; provide a video with a known video-stream duration`);
@@ -196,26 +227,22 @@ async function probe(video, videoStream) {
   const [sarNum, sarDen] = String(stream.sample_aspect_ratio ?? '').split(':').map(Number);
   const storedSar = sarNum > 0 && sarDen > 0 ? sarNum / sarDen : 1;
   const sar = swap ? 1 / storedSar : storedSar;
-  return { video, videoStream, streamIndex: stream.index, duration, width: swap ? stream.height : stream.width, height: swap ? stream.width : stream.height,
+  const relativeStart = streamStart - containerMicros / 1e6;
+  // Clipping a first PTS just before the rounded container origin to zero must not extend the stream's end.
+  return { [SOURCE_FORMAT]: format.format_name ?? '', video, videoStream, streamIndex: stream.index, start: Math.max(0, relativeStart), end: relativeStart + duration, duration,
+    containerStart: containerMicros / 1e6, width: swap ? stream.height : stream.width, height: swap ? stream.width : stream.height,
     sar, rotation, codedWidth: stream.width, codedHeight: stream.height, fps, frameRate: stream.avg_frame_rate ?? null,
     frameCount, frameCountEstimated, codec: stream.codec_name, pixelFormat: stream.pix_fmt ?? null,
     bitDepth: Number.isInteger(bitDepth) && bitDepth > 0 ? bitDepth : null,
     hasAudio: streams.some((entry) => entry.codec_type === 'audio'), durationSource };
 }
 
-async function packetDuration(video, videoStream) {
+// Runs ffprobe and passes each stdout line to `consume` as it arrives, so packet listings are never held whole.
+function ffprobeLines(args, consume) {
   return new Promise((resolve, reject) => {
-    const child = spawn('ffprobe', ['-v', 'error', '-select_streams', `v:${videoStream}`, '-show_entries', 'packet=pts_time,duration_time', '-of', 'csv=p=0', video], { stdio: ['ignore', 'pipe', 'pipe'] });
-    let start = Infinity;
-    let end = -Infinity;
+    const child = spawn('ffprobe', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let pending = '';
     let stderr = '';
-    const consume = (line) => {
-      const [pts, length] = line.split(',').map((field) => (/^-?\d+(?:\.\d+)?$/.test(field?.trim() ?? '') ? Number(field) : NaN));
-      if (!Number.isFinite(pts) || !Number.isFinite(length)) return;
-      start = Math.min(start, pts);
-      end = Math.max(end, pts + length);
-    };
     child.stdout.on('data', (chunk) => {
       const lines = (pending + chunk).split('\n');
       pending = lines.pop();
@@ -226,9 +253,28 @@ async function packetDuration(video, videoStream) {
     child.on('close', (code) => {
       if (code !== 0) return reject(new Error(`ffprobe exited ${code}: ${stderr.trim()}`));
       consume(pending);
-      resolve(end - start);
+      resolve();
     });
   });
+}
+
+async function packetSpan(video, videoStream, ticksToSeconds) {
+  let start = Infinity;
+  let end = -Infinity;
+  await ffprobeLines(['-v', 'error', '-select_streams', `v:${videoStream}`, '-show_entries', 'packet=pts,duration,pts_time,duration_time', '-of', 'compact', video], (line) => {
+    if (!line.startsWith('packet|')) return;
+    const fields = Object.fromEntries(line.trim().split('|').slice(1).map((field) => field.split('=')));
+    const seconds = (ticks, time) => {
+      const exact = ticksToSeconds(Number(ticks));
+      return Number.isFinite(exact) ? exact : /^-?\d+(?:\.\d+)?$/.test(time ?? '') ? Number(time) : NaN;
+    };
+    const pts = seconds(fields.pts, fields.pts_time);
+    const length = seconds(fields.duration, fields.duration_time);
+    if (!Number.isFinite(pts) || !Number.isFinite(length)) return;
+    start = Math.min(start, pts);
+    end = Math.max(end, pts + length);
+  });
+  return { start, end };
 }
 
 async function findProjectRoot(cwd) {
@@ -283,9 +329,41 @@ async function outputDirectory(video, command, requested) {
   }
 }
 
-async function extract(video, videoStream, time, width, filename, crop) {
+async function extract(video, info, time, width, filename, crop) {
   const cut = crop ? `crop=${crop.pixels.width}:${crop.pixels.height}:${crop.pixels.x}:${crop.pixels.y},` : '';
-  await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-ss', String(time), '-i', video, '-map', `0:v:${videoStream}`, '-frames:v', '1', '-vf', `${cut}scale=${width}:max(2\\,round(${width}/dar/2)*2),setsar=1`, '-threads:v', '1', '-q:v', '4', '-y', filename]);
+  let emptyError;
+  // MPEG-TS input seeking can silently skip a GOP, so it always needs decoding from the origin.
+  const originDecode = info[SOURCE_FORMAT].split(',').includes('mpegts');
+  for (const slow of originDecode ? [true] : [false, true]) {
+    // Other demuxers can seek past the initial keyframe's DTS. Retry from the origin if that produced no frame.
+    const input = slow ? ['-i', video, '-ss', String(time)] : ['-ss', String(time), '-i', video];
+    try {
+      await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', ...input, '-map', `0:v:${info.videoStream}`, '-frames:v', '1', '-vf', `${cut}scale=${width}:max(2\\,round(${width}/dar/2)*2),setsar=1`, '-threads:v', '1', '-q:v', '4', '-y', filename]);
+    } catch (error) {
+      // FFmpeg 8 can fail to initialize MJPEG at EOF when seeking yielded no decoded frame.
+      if (await nonempty(filename) || !/Non full-range YUV[\s\S]*Could not open encoder before EOF/.test(error.message)) throw error;
+      error.emptyFrame = true;
+      emptyError ??= error;
+    }
+    if (await nonempty(filename)) return;
+  }
+  if (emptyError) throw emptyError;
+}
+
+// Time of the last video frame, from the largest packet pts in the file. Scan without seeking:
+// a demuxer can seek past a later-PTS packet that precedes the final B-frame in decode order.
+// Resolves NaN when ffprobe reports no usable pts or time base.
+async function lastFrameTime(info) {
+  let last = -Infinity;
+  let timeBase;
+  await ffprobeLines(['-v', 'error', '-select_streams', `v:${info.videoStream}`,
+    '-show_entries', 'packet=pts:stream=time_base', '-of', 'compact', info.video], (line) => {
+    const pts = /^packet\|pts=(-?\d+)(?:\||$)/.exec(line.trim());
+    if (pts && Number.isSafeInteger(Number(pts[1]))) last = Math.max(last, Number(pts[1]));
+    timeBase = /^stream\|time_base=([1-9]\d*)\/([1-9]\d*)$/.exec(line.trim())?.slice(1).map(Number) ?? timeBase;
+  });
+  // The rounded container origin can be a fraction of a microsecond after this PTS; timeline zero still shows it.
+  return Number.isFinite(last) && timeBase ? Math.max(0, last * timeBase[0] / timeBase[1] - info.containerStart) : NaN;
 }
 
 const ANALYSIS_FPS = 30;
@@ -294,9 +372,10 @@ const PIXEL_DELTA = 16;
 
 // One decode pass over the range: RGB source frames thinned to at most analysisFps/s (select keeps source pts;
 // no fps resampling), each scored as the share of pixels with any channel differing by more than 16/255 from the last reported frame
-// (initially the first decoded one, at the range start). Times are source pts from showinfo, which -ss input seeking
-// makes relative to the range start. Streams rawvideo; keeps only the
-// reference frame and frames still waiting for their pts line.
+// (initially the first decoded one, at the range start). -copyts keeps source pts; times come from showinfo's integer
+// pts and time base, since its pts_time can be rounded (%.6g in FFmpeg 5.1). Passing such a time to -ss selects that frame:
+// FFmpeg truncates -ss to microseconds, at or before the pts, then rounds it to the nearest tick of the stream time base.
+// Streams rawvideo; keeps only the reference frame and frames still waiting for their pts line.
 // changes uses -fps_mode (FFmpeg 5.1+). Unparseable versions, such as git builds, are let through.
 async function requireFfmpeg51() {
   const first = (await run('ffmpeg', ['-version'])).split('\n')[0];
@@ -306,15 +385,19 @@ async function requireFfmpeg51() {
   }
 }
 
-function detectChanges(video, info, range, crop, { threshold, minGap, max, analysisFps, analysisWidth }) {
+function detectChanges(video, info, range, crop, settings, slow = info[SOURCE_FORMAT].split(',').includes('mpegts')) {
+  const { threshold, minGap, max, analysisFps, analysisWidth } = settings;
   const sourceWidth = crop?.pixels.width ?? info.width;
   const sourceHeight = crop?.pixels.height ?? info.height;
   const height = Math.max(2, Math.round(analysisWidth * sourceHeight / sourceWidth / 2) * 2);
   const pixels = analysisWidth * height;
   const size = pixels * 3;
   const cut = crop ? `crop=${crop.pixels.width}:${crop.pixels.height}:${crop.pixels.x}:${crop.pixels.y},` : '';
-  const args = ['-hide_banner', '-nostats', '-loglevel', 'info', '-ss', String(range.start), '-to', String(range.end), '-i', video,
-    '-map', `0:v:${info.videoStream}`, '-vf', `${cut}select='isnan(prev_selected_t)+gte(t-prev_selected_t,${1 / analysisFps - 1e-6})',scale=${analysisWidth}:${height},format=rgb24,showinfo`,
+  const seek = slow ? [] : ['-ss', String(range.start)];
+  // With copyts, trimming must use absolute source PTS and precede select/showinfo to keep frame/time pairing intact.
+  const trim = slow ? `trim=start=${range.start + info.containerStart}:end=${range.end + info.containerStart},` : '';
+  const args = ['-hide_banner', '-nostats', '-loglevel', 'info', '-copyts', ...seek, '-to', String(range.end), '-i', video,
+    '-map', `0:v:${info.videoStream}`, '-vf', `${trim}${cut}select='isnan(prev_selected_t)+gte(t-prev_selected_t,${1 / analysisFps - 1e-6})',scale=${analysisWidth}:${height},format=rgb24,showinfo`,
     '-fps_mode', 'passthrough', '-threads:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'];
   return new Promise((resolve, reject) => {
     const child = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -327,6 +410,7 @@ function detectChanges(video, info, range, crop, { threshold, minGap, max, analy
     let failed;
     let reference;
     let lastReport = range.start;
+    let timeBase;
     let partial = Buffer.alloc(size);
     let filled = 0;
     let line = '';
@@ -342,8 +426,7 @@ function detectChanges(video, info, range, crop, { threshold, minGap, max, analy
     const drain = () => {
       while (pendingFrames.length && pendingTimes.length) {
         const frame = pendingFrames.shift();
-        // Floor so a later `-ss time` never lands just after this frame's pts.
-        const time = Math.floor((range.start + pendingTimes.shift()) * 1000 + 1e-6) / 1000;
+        const time = pendingTimes.shift();
         decoded++;
         if (!reference) { reference = frame; continue; }
         if (!(time > range.start && time < range.end) || time - lastReport < minGap - 1e-9) continue;
@@ -380,8 +463,14 @@ function detectChanges(video, info, range, crop, { threshold, minGap, max, analy
       line = lines.pop();
       for (const text of lines) {
         if (/Parsed_showinfo/.test(text)) {
-          const match = /\bn:\s*\d+\s+pts:\s*-?\d+\s+pts_time:\s*(-?[\d.e+-]+)/.exec(text);
-          if (match) pendingTimes.push(Number(match[1]));
+          const base = /\bconfig in time_base:\s*(\d+)\/(\d+)/.exec(text);
+          if (base) timeBase = [Number(base[1]), Number(base[2])];
+          const match = /\bn:\s*\d+\s+pts:\s*(-?\d+)\s/.exec(text);
+          if (match && !timeBase && !failed) {
+            failed = new Error('ffmpeg showinfo logged no time base');
+            child.kill();
+          }
+          if (match && timeBase) pendingTimes.push(Number(match[1]) * timeBase[0] / timeBase[1] - info.containerStart);
         } else if (text.trim()) {
           errors.push(text.trim());
           if (errors.length > 20) errors.shift();
@@ -397,7 +486,8 @@ function detectChanges(video, info, range, crop, { threshold, minGap, max, analy
       if (pendingFrames.length || pendingTimes.length || filled) {
         return reject(new Error(`ffmpeg frame/pts mismatch: ${pendingFrames.length} frames and ${pendingTimes.length} times unpaired, ${filled} trailing bytes`));
       }
-      if (!decoded) return reject(new Error(`no decodable frames between ${formatTimecode(range.start)} and ${formatTimecode(range.end)}`));
+      if (!decoded && !slow) return resolve(detectChanges(video, info, range, crop, settings, true));
+      // A valid sparse range may contain no new PTS. Baseline extraction still validates its displayed frame.
       resolve({ events, candidates });
     });
   });
@@ -553,7 +643,9 @@ export async function main(args) {
   }
   const info = await probe(video, videoStream);
   const crop = options.crop === undefined ? undefined : parseCrop(options.crop, info);
-  const width = Math.min(crop?.pixels.displayed.width ?? info.width, numberOption(options.width ?? 640, 'width', 64, 4096, true));
+  // Cap at the displayed width so square-pixel output is never larger than the displayed frame or crop.
+  const displayedWidth = (crop?.pixels.displayed ?? displayedSize(info.width, info.height, info)).width;
+  const width = Math.min(displayedWidth, numberOption(options.width ?? 640, 'width', 64, 4096, true));
   let times;
   let windows;
   let range;
@@ -574,8 +666,9 @@ export async function main(args) {
       const arounds = [...new Set(options.around.map(parseTime))].sort((a, b) => a - b);
       const window = numberOption(parseTime(options.window ?? '2s'), 'window', 0.001, 3600);
       spans = arounds.map((around) => {
-        if (around > info.duration) throw new Error(`--around ${formatTimecode(around)} is beyond the video duration`);
-        return { around, start: Math.max(0, around - window / 2), end: Math.min(info.duration, around + window / 2) };
+        if (around > info.end) throw new Error(`--around ${formatTimecode(around)} is beyond the video end ${formatTimecode(info.end)}`);
+        if (around < info.start) throw new Error(`--around ${formatTimecode(around)} is before the video starts at ${formatTimecode(info.start)}`);
+        return { around, start: Math.max(info.start, around - window / 2), end: Math.min(info.end, around + window / 2) };
       });
     }
     times = [];
@@ -595,7 +688,8 @@ export async function main(args) {
     const threshold = Number(options.threshold ?? 0.002);
     if (!(threshold > 0 && threshold <= 1)) throw new Error('--threshold must be a fraction above 0 and at most 1');
     const minGap = numberOption(parseTime(options['min-gap'] ?? '0.5'), 'min-gap', 0, 3600);
-    const max = numberOption(options.max ?? 48, 'max', 1, 240, true);
+    // One of the 240 frames is the range-start baseline.
+    const max = numberOption(options.max ?? 48, 'max', 1, 239, true);
     const analysisFps = numberOption(options['analysis-fps'] ?? ANALYSIS_FPS, 'analysis-fps', 1, 60);
     const analysisWidth = numberOption(options['analysis-width'] ?? ANALYSIS_WIDTH, 'analysis-width', 64, 512, true);
     range = resolveRange(options, info);
@@ -610,7 +704,8 @@ export async function main(args) {
     if (options.at === undefined) throw new Error('frame requires --at');
     times = [...new Set(options.at.map((value) => {
       const time = parseTime(value);
-      if (time >= info.duration) throw new Error(`--at ${value} must be before the video ends`);
+      if (time >= info.end) throw new Error(`--at ${value} must be before the video ends at ${formatTimecode(info.end)}`);
+      if (time < info.start) throw new Error(`--at ${value} is before the video starts at ${formatTimecode(info.start)}`);
       return time;
     }))].sort((a, b) => a - b);
     if (times.length > 240) throw new Error('frame would create over 240 frames; reduce --at values');
@@ -618,17 +713,21 @@ export async function main(args) {
   const { directory, created, firstParent } = await outputDirectory(video, command, options.output);
   const frames = [];
   const produced = [];
+  // Shared by every position that finds no frame, including concurrent ones.
+  let lastFrame;
   const extractFrame = async (time, i) => {
     const timecode = formatTimecode(time);
     const filename = `frame-${String(i).padStart(4, '0')}_${timecode.replaceAll(':', '-')}.jpg`;
     const target = path.join(directory, filename);
     produced.push(target);
     let extractionError;
-    try { await extract(video, videoStream, time, width, target, crop); }
-    catch (error) { extractionError = error; }
+    try { await extract(video, info, time, width, target, crop); }
+    catch (error) { if (!error.emptyFrame) throw error; extractionError = error; }
     if (extractionError && await nonempty(target)) throw extractionError;
-    if (!(await nonempty(target)) && info.duration - time < 0.1) {
-      await extract(video, videoStream, Math.max(0, info.duration - 0.1), width, target, crop);
+    if (!(await nonempty(target))) {
+      // No frame at or after `time`: if it is in the last frame's display interval (such as a sparse VFR tail), take that frame.
+      const last = await (lastFrame ??= lastFrameTime(info).catch(() => NaN));
+      if (Number.isFinite(last) && last >= info.start && last < time) await extract(video, info, last, width, target, crop);
     }
     if (!(await nonempty(target))) throw extractionError ?? new Error(`FFmpeg produced no frame for ${time}s`);
     return { file: filename, time, timecode };

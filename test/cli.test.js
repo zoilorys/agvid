@@ -605,7 +605,7 @@ function uiClip(directory) {
 async function changesManifest(output) {
   const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
   assert.equal(output.changes, manifest.frames.length - 1);
-  assert.deepEqual([manifest.frames[0].time, manifest.frames[0].score], [manifest.range?.start ?? 0, null]);
+  assert.deepEqual([manifest.frames[0].time, manifest.frames[0].score], [manifest.range?.start ?? manifest.source.start, null]);
   for (const frame of manifest.frames.slice(1)) assert.ok(frame.score > manifest.detection.threshold, JSON.stringify(frame));
   for (const file of [...manifest.frames.map((frame) => frame.file), ...manifest.sheets.map((sheet) => sheet.file)]) jpegInfo(path.join(output.directory, file));
   return manifest;
@@ -667,7 +667,7 @@ test('crop restricts detection and ranges bound it', async () => {
     assert.equal(ranged.changes, 1);
     assert.ok(Math.abs(rangedManifest.frames[1].time - 3) <= 0.1, String(rangedManifest.frames[1].time));
 
-    for (const args of [['--threshold', '0'], ['--threshold', '1.5'], ['--max', '241'], ['--min-gap', '-1']]) {
+    for (const args of [['--threshold', '0'], ['--threshold', '1.5'], ['--max', '240'], ['--min-gap', '-1']]) {
       const bad = invoke('changes', source, ...args, '--output', path.join(directory, 'bad'));
       assert.notEqual(bad.status, 0);
     }
@@ -708,7 +708,7 @@ test('max truncates by score', async () => {
     const times = manifest.frames.map((frame) => frame.time);
     assert.ok(times.every((time, i) => i === 0 || time > times[i - 1]), times.join());
 
-    const gapped = success('changes', source, '--min-gap', '1', '--max', '240', '--output', path.join(directory, 'gap'));
+    const gapped = success('changes', source, '--min-gap', '1', '--max', '239', '--output', path.join(directory, 'gap'));
     const gappedManifest = await changesManifest(gapped);
     const gappedTimes = gappedManifest.frames.map((frame) => frame.time);
     assert.ok(gappedTimes.length > 2);
@@ -958,5 +958,276 @@ test('changes rejects FFmpeg older than 5.1 before creating output, and accepts 
     await chmod(shim, 0o755);
     const ok = invokeIn({ cwd: directory, env }, 'changes', video, '--end', '3', '--output', path.join(directory, 'out'));
     assert.equal(ok.status, 0, ok.stderr);
+  });
+});
+
+// Mean gray level (0-255) of the left and right halves of a decoded image.
+function halves(file) {
+  const decoded = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-i', file, '-vf', 'scale=32:16', '-f', 'rawvideo', '-pix_fmt', 'gray', '-'], { encoding: 'buffer' });
+  assert.equal(decoded.status, 0, decoded.stderr.toString());
+  const sums = [0, 0];
+  decoded.stdout.forEach((value, i) => { sums[i % 32 < 16 ? 0 : 1] += value; });
+  return sums.map((sum) => sum / 256);
+}
+
+// 160x90 at 10 fps for 3 s; the left half turns white 1.5 s into the video stream.
+const HALF_FLIP = "color=black:size=160x90:rate=10:duration=3,drawbox=w=80:h=90:color=white:t=fill:enable='gte(t,1.5)'";
+
+test('a video stream starting after the audio keeps container times across commands', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'delayed.mp4');
+    ffmpeg('-f', 'lavfi', '-i', 'sine=duration=5', '-itsoffset', '2', '-f', 'lavfi', '-i', HALF_FLIP,
+      '-map', '0:a', '-map', '1:v', '-c:a', 'aac', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', source);
+    const info = success('probe', source);
+    assert.deepEqual([info.start, info.end, info.duration, info.containerStart], [2, 5, 3, 0]);
+
+    const changes = success('changes', source, '--output', path.join(directory, 'changes'));
+    const manifest = await changesManifest(changes);
+    assert.equal(manifest.frames[0].time, 2);
+    assert.deepEqual(manifest.frames.slice(1).map((frame) => frame.time), [3.5]);
+    const [left, right] = halves(path.join(changes.directory, manifest.frames[1].file));
+    assert.ok(left > 200 && right < 40, `${left} ${right}`);
+    assert.ok(halves(path.join(changes.directory, manifest.frames[0].file))[0] < 40);
+
+    const overview = JSON.parse(await readFile(success('overview', source, '--frames', '3', '--output', path.join(directory, 'overview')).manifest, 'utf8'));
+    assert.deepEqual(overview.frames.map((frame) => frame.time), [2.5, 3.5, 4.5]);
+    const ranged = JSON.parse(await readFile(success('overview', source, '--start', '0', '--end', '9', '--frames', '1', '--output', path.join(directory, 'ranged')).manifest, 'utf8'));
+    assert.deepEqual(ranged.range, { start: 2, end: 5 });
+    const inspect = JSON.parse(await readFile(success('inspect', source, '--around', '4.9', '--window', '1s', '--fps', '2', '--output', path.join(directory, 'inspect')).manifest, 'utf8'));
+    assert.deepEqual([inspect.windows[0].start, inspect.windows[0].end], [4.4, 5]);
+
+    for (const [command, args, message] of [['frame', ['--at', '1'], /--at 1 is before the video starts at 00:02\.000/],
+      ['inspect', ['--around', '1.5'], /before the video starts/], ['overview', ['--start', '5'], /must be before the video ends/]]) {
+      const bad = invoke(command, source, ...args, '--output', path.join(directory, 'bad'));
+      assert.notEqual(bad.status, 0);
+      assert.match(bad.stderr, message);
+    }
+    assert.ok(!(await readdir(directory)).includes('bad'));
+  });
+});
+
+test('a nonzero container start time is timeline zero', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'shifted.mkv');
+    ffmpeg('-f', 'lavfi', '-i', HALF_FLIP, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-output_ts_offset', '7', '-y', source);
+    const info = success('probe', source);
+    // The Matroska DURATION tag holds the raw endpoint (10 s); subtract the stream's 7 s start.
+    assert.deepEqual([info.containerStart, info.start, info.end, info.durationSource], [7, 0, 3, 'tag']);
+    const changes = success('changes', source, '--output', path.join(directory, 'changes'));
+    const manifest = await changesManifest(changes);
+    assert.deepEqual(manifest.frames.map((frame) => frame.time), [0, 1.5]);
+    const frames = JSON.parse(await readFile(success('frame', source, '--at', '1.4,1.6', '--output', path.join(directory, 'frame')).manifest, 'utf8'));
+    assert.deepEqual(frames.frames.map((frame) => halves(path.join(directory, 'frame', frame.file))[0] > 200), [false, true]);
+  });
+});
+
+test('a shifted WebM uses its duration tag when optional packet durations are unavailable', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'shifted.webm');
+    ffmpeg('-f', 'lavfi', '-i', HALF_FLIP, '-c:v', 'libvpx-vp9', '-deadline', 'realtime', '-cpu-used', '8',
+      '-pix_fmt', 'yuv420p', '-output_ts_offset', '2', '-y', source);
+    const data = await readFile(source);
+    // DefaultDuration is optional in Matroska. Replace its 8-byte element with an equally sized EBML Void,
+    // keeping cluster offsets and the endpoint tag intact while removing assumed packet durations.
+    const offset = data.indexOf(Buffer.from([0x23, 0xe3, 0x83, 0x84]));
+    assert.ok(offset >= 0, 'generated WebM has no 4-byte DefaultDuration');
+    Buffer.from([0xec, 0x86, 0, 0, 0, 0, 0, 0]).copy(data, offset);
+    await writeFile(source, data);
+    const raw = spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries',
+      'packet=duration,duration_time:stream=start_time:stream_tags=DURATION', '-of', 'json', source], { encoding: 'utf8' });
+    assert.equal(raw.status, 0, raw.stderr);
+    const metadata = JSON.parse(raw.stdout);
+    assert.deepEqual([metadata.streams[0].start_time, metadata.streams[0].tags.DURATION], ['2.000000', '00:00:05.000000000']);
+    assert.equal(metadata.packets.length, 30);
+    assert.ok(metadata.packets.every((packet) => packet.duration === undefined && packet.duration_time === undefined));
+
+    const info = success('probe', source);
+    assert.deepEqual([info.containerStart, info.start, info.end, info.duration, info.durationSource], [2, 0, 3, 3, 'tag']);
+    const output = success('frame', source, '--at', '0.5,2.95', '--output', path.join(directory, 'out'));
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    assert.deepEqual(manifest.frames.map((frame) => frame.time), [0.5, 2.95]);
+    assert.deepEqual(manifest.frames.map((frame) => halves(path.join(output.directory, frame.file))[0] > 200), [false, true]);
+  });
+});
+
+test('changes keeps the exact pts of a one-frame flash when showinfo logs six-digit pts_time', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'late-flash.mp4');
+    // At 60 fps frame 6001 is at 100.0166667 s; FFmpeg 5.1 logs its pts_time as 100.017, after the frame.
+    ffmpeg('-f', 'lavfi', '-i', 'color=black:size=64x36:rate=60:duration=101',
+      '-vf', "drawbox=color=white:t=fill:enable='eq(n,6001)'", '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', '-y', source);
+    const real = spawnSync('sh', ['-c', 'command -v ffmpeg'], { encoding: 'utf8' }).stdout.trim();
+    const bin = path.join(directory, 'bin');
+    await mkdir(bin);
+    await writeFile(path.join(bin, 'ffmpeg'), `#!${process.execPath}
+const { spawn } = require('node:child_process');
+const child = spawn(${JSON.stringify(real)}, process.argv.slice(2), { stdio: ['inherit', 'inherit', 'pipe'] });
+let pending = '';
+const legacy = (text) => text.replace(/pts_time:(-?[\\d.e+-]+)/g, (_, t) => 'pts_time:' + Number(Number(t).toPrecision(6)));
+child.stderr.on('data', (chunk) => { const lines = (pending + chunk).split('\\n'); pending = lines.pop(); for (const line of lines) process.stderr.write(legacy(line) + '\\n'); });
+child.on('close', (code) => { process.stderr.write(legacy(pending)); process.exitCode = code; });
+`);
+    await chmod(path.join(bin, 'ffmpeg'), 0o755);
+    const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` };
+    const legacyLog = spawnSync('ffmpeg', ['-hide_banner', '-copyts', '-ss', '100', '-i', source, '-vf', 'showinfo', '-frames:v', '2', '-f', 'null', '-'], { encoding: 'utf8', env });
+    assert.match(legacyLog.stderr, /pts_time:100\.017\s/);
+
+    const result = invokeIn({ env }, 'changes', source, '--start', '99.5', '--end', '100.5', '--analysis-fps', '60', '--output', path.join(directory, 'out'));
+    assert.equal(result.status, 0, result.stderr);
+    const manifest = await changesManifest(JSON.parse(result.stdout));
+    assert.equal(manifest.frames.length, 2);
+    assert.equal(manifest.frames[1].score, 1);
+    assert.ok(Math.abs(manifest.frames[1].time - 6001 / 60) < 1e-9, String(manifest.frames[1].time));
+    assert.ok(halves(path.join(directory, 'out', manifest.frames[1].file)).every((mean) => mean > 200));
+  });
+});
+
+test('times inside the last frame interval return the last frame, including sparse VFR tails', async () => {
+  await withTempDirectory(async (directory) => {
+    const bytes = async (manifestFile) => {
+      const manifest = JSON.parse(await readFile(manifestFile, 'utf8'));
+      return Promise.all(manifest.frames.map((frame) => readFile(path.join(path.dirname(manifestFile), frame.file))));
+    };
+    const cfr = path.join(directory, 'one-fps.mp4');
+    ffmpeg('-f', 'lavfi', '-i', 'testsrc2=size=160x90:rate=1:duration=3', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', cfr);
+    const [last] = await bytes(success('frame', cfr, '--at', '2', '--output', path.join(directory, 'cfr-2')).manifest);
+    const tail = success('frame', cfr, '--at', '2.5,2.999', '--output', path.join(directory, 'cfr-tail'));
+    assert.deepEqual(JSON.parse(await readFile(tail.manifest, 'utf8')).frames.map((frame) => frame.time), [2.5, 2.999]);
+    assert.ok((await bytes(tail.manifest)).every((image) => image.equals(last)));
+    const overview = JSON.parse(await readFile(success('overview', cfr, '--output', path.join(directory, 'overview')).manifest, 'utf8'));
+    assert.equal(overview.frames.length, 12);
+    const inspect = success('inspect', cfr, '--around', '2.5', '--window', '0.5', '--output', path.join(directory, 'inspect'));
+    assert.ok((await bytes(inspect.manifest)).every((image) => image.equals(last)));
+
+    // Frames at 0 and 1.47 s; the second is shown until 3.5 s.
+    const sparse = path.join(directory, 'sparse.mp4');
+    const tailed = path.join(directory, 'sparse-tail.mp4');
+    ffmpeg('-f', 'lavfi', '-i', 'color=black:size=160x90:rate=100:duration=1.5',
+      '-vf', "drawbox=w=80:h=90:color=white:t=fill:enable='gte(n,147)',select='eq(n,0)+eq(n,147)'", '-fps_mode', 'vfr', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', sparse);
+    ffmpeg('-i', sparse, '-c', 'copy', '-bsf:v', "setts=duration='if(eq(N,1),2.03/TB,DURATION)'", '-y', tailed);
+    assert.equal(success('probe', tailed).end, 3.5);
+    const [lit] = await bytes(success('frame', tailed, '--at', '1.47', '--output', path.join(directory, 'sparse-lit')).manifest);
+    assert.ok(halves(path.join(directory, 'sparse-lit', 'frame-0000_00-01.470.jpg'))[0] > 200);
+    assert.ok((await bytes(success('frame', tailed, '--at', '2,3.4', '--output', path.join(directory, 'sparse-tail')).manifest)).every((image) => image.equals(lit)));
+  });
+});
+
+test('the last frame of an MPEG-TS clip remains available throughout its display interval', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'tail.ts');
+    ffmpeg('-f', 'lavfi', '-i', 'color=black:size=160x90:rate=1:duration=3',
+      '-vf', "drawbox=color=white:t=fill:enable='eq(n,2)'", '-c:v', 'libx264', '-g', '1', '-y', source);
+    const output = success('frame', source, '--at', '2.5', '--output', path.join(directory, 'out'));
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    assert.equal(manifest.frames[0].time, 2.5);
+    assert.ok(halves(path.join(output.directory, manifest.frames[0].file)).every((mean) => mean > 200));
+  });
+});
+
+test('a one-frame stream keeps precise tick boundaries when its start rounds up in ffprobe', async () => {
+  await withTempDirectory(async (directory) => {
+    const delayed = path.join(directory, 'delayed.mp4');
+    const shifted = path.join(directory, 'shifted.mp4');
+    const picture = 'color=white:size=64x36:rate=60:duration=0.0166666666666667';
+    // A high movie timescale preserves the 1/60 s offset; ffprobe prints it as 0.016667 s.
+    ffmpeg('-f', 'lavfi', '-i', 'anullsrc=sample_rate=48000:duration=0.05', '-itsoffset', String(1 / 60),
+      '-f', 'lavfi', '-i', picture, '-map', '0:a', '-map', '1:v', '-c:a', 'aac', '-c:v', 'libx264',
+      '-pix_fmt', 'yuv420p', '-movie_timescale', '60000', '-y', delayed);
+    ffmpeg('-f', 'lavfi', '-i', picture, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movie_timescale', '60000',
+      '-output_ts_offset', String(1 / 60), '-y', shifted);
+    for (const [source, start, at] of [[delayed, 1 / 60, 0.02], [shifted, 0, 0.01]]) {
+      const info = success('probe', source);
+      assert.equal(info.start, start);
+      assert.ok(Math.abs(info.duration - 1 / 60) < 1e-12, String(info.duration));
+      const name = path.parse(source).name;
+      for (const [command, args] of [['frame', ['--at', String(at)]], ['overview', ['--frames', '3']],
+        ['inspect', ['--around', String(at), '--window', '0.005s']], ['changes', []]]) {
+        const output = success(command, source, ...args, '--output', path.join(directory, `${name}-${command}`));
+        const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+        assert.ok(manifest.frames.length > 0, command);
+        if (command === 'frame') assert.equal(manifest.frames[0].time, at);
+        if (command === 'changes') assert.deepEqual(manifest.frames.map((frame) => frame.time), [start]);
+        for (const frame of manifest.frames) {
+          assert.ok(frame.time >= info.start && frame.time < info.end);
+          assert.ok(halves(path.join(output.directory, frame.file)).every((mean) => mean > 200), `${name} ${command}`);
+        }
+      }
+      // A time beyond the precise display interval must not be admitted by rounding the endpoint up.
+      const beyond = (info.end + (source === delayed ? 0.033334 : 1 / 60)) / 2;
+      const bad = invoke('frame', source, '--at', String(beyond), '--output', path.join(directory, `${name}-bad`));
+      assert.notEqual(bad.status, 0);
+      assert.match(bad.stderr, /must be before the video ends/);
+    }
+  });
+});
+
+test('anamorphic frames and crops are never enlarged, with or without rotation', async () => {
+  await withTempDirectory(async (directory) => {
+    const plain = path.join(directory, 'narrow.mp4');
+    const rotated = path.join(directory, 'narrow-rotated.mp4');
+    // 160x90 stored pixels, each half as wide as tall: an 80x90 square-pixel picture, 90x80 once turned.
+    // Red left and right quarters become the top and bottom bands after a 90 degree turn in either direction.
+    ffmpeg('-f', 'lavfi', '-i', 'color=blue:size=160x90:rate=10:duration=1',
+      '-vf', 'drawbox=x=0:y=0:w=40:h=90:color=red:t=fill,drawbox=x=120:y=0:w=40:h=90:color=red:t=fill,setsar=1/2', '-c:v', 'mpeg4', '-q:v', '2', '-y', plain);
+    ffmpeg('-display_rotation', '90', '-i', plain, '-c', 'copy', '-y', rotated);
+    for (const [source, crop, size, red] of [
+      [plain, [], [80, 90]], [plain, ['--crop', '0,0,1,1'], [80, 90]], [plain, ['--crop', '0,0,0.25,1'], [20, 90], true],
+      [rotated, [], [90, 80]], [rotated, ['--crop', '0,0,1,1'], [90, 80]], [rotated, ['--crop', '0,0,1,0.25'], [90, 20], true],
+    ]) {
+      const output = success('frame', source, '--at', '0.5', ...crop, '--output', path.join(directory, `out-${path.parse(source).name}-${crop.join('')}`));
+      const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+      if (crop.length) assert.deepEqual(Object.values(manifest.crop.pixels.displayed), size);
+      const file = path.join(output.directory, manifest.frames[0].file);
+      const image = jpegInfo(file);
+      assert.equal(image.sample_aspect_ratio, '1:1');
+      assert.deepEqual([image.width, image.height], size, `${source} ${crop}`);
+      if (red) assert.ok(redShare(file) > 0.9, `${source} ${crop}`);
+    }
+  });
+});
+
+test('changes --max caps detected changes so the baseline keeps the run at 240 frames', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'blink.mp4');
+    // A box toggles every frame: 259 equal-score candidates after the first frame.
+    ffmpeg('-f', 'lavfi', '-i', 'color=black:size=64x36:rate=10:duration=26',
+      '-vf', "drawbox=w=16:h=16:color=white:t=fill:enable='mod(n,2)'", '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', source);
+    const output = success('changes', source, '--min-gap', '0', '--max', '239', '--output', path.join(directory, 'out'));
+    const manifest = await changesManifest(output);
+    assert.deepEqual([output.frames, output.changes, manifest.detection.candidates, manifest.detection.truncated], [240, 239, 259, true]);
+    // Ties keep the earliest times.
+    assert.ok(Math.abs(manifest.frames.at(-1).time - 23.9) < 1e-6, String(manifest.frames.at(-1).time));
+    const bad = invoke('changes', source, '--max', '240', '--output', path.join(directory, 'bad'));
+    assert.match(bad.stderr, /--max must be an integer from 1 to 239/);
+    assert.ok(!(await readdir(directory)).includes('bad'));
+  });
+});
+
+test('tail positions share one last-frame lookup, and an unusable lookup keeps the extraction error', async () => {
+  await withTempDirectory(async (directory) => {
+    const source = path.join(directory, 'one-fps.mp4');
+    ffmpeg('-f', 'lavfi', '-i', 'testsrc2=size=160x90:rate=1:duration=3', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', source);
+    const real = spawnSync('sh', ['-c', 'command -v ffprobe'], { encoding: 'utf8' }).stdout.trim();
+    const bin = path.join(directory, 'bin');
+    const calls = path.join(directory, 'calls');
+    await mkdir(bin);
+    // Logs tail lookups; with EMPTY set they list no packets, like a source without usable timestamps.
+    await writeFile(path.join(bin, 'ffprobe'), `#!/bin/sh
+case " $* " in *" -show_entries packet=pts:stream=time_base "*) echo x >> "${calls}"; [ -n "$EMPTY" ] && exit 0;; esac
+exec "${real}" "$@"
+`);
+    await chmod(path.join(bin, 'ffprobe'), 0o755);
+    const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` };
+    // The default 12 frames put 2.125, 2.375, 2.625 and 2.875 s after the last frame at 2 s.
+    const overview = invokeIn({ env }, 'overview', source, '--output', path.join(directory, 'overview'));
+    assert.equal(overview.status, 0, overview.stderr);
+    assert.equal(JSON.parse(overview.stdout).frames, 12);
+    assert.equal(await readFile(calls, 'utf8'), 'x\n');
+
+    const failed = invokeIn({ env: { ...env, EMPTY: '1' } }, 'frame', source, '--at', '2.5', '--output', path.join(directory, 'failed'));
+    assert.notEqual(failed.status, 0);
+    assert.match(failed.stderr, /ffmpeg exited/);
+    assert.doesNotMatch(failed.stderr, /Infinity|NaN/);
+    assert.deepEqual((await readdir(directory)).sort(), ['bin', 'calls', 'one-fps.mp4', 'overview']);
   });
 });
