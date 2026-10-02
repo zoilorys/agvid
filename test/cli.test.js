@@ -28,6 +28,12 @@ function ffmpeg(...args) {
   assert.equal(result.status, 0, result.stderr);
 }
 
+// FFmpeg 6.0 added -display_rotation; 5.1 takes the rotate tag, which it maps to the same display matrix.
+function rotate90(input, output) {
+  const result = spawnSync('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-display_rotation', '90', '-i', input, '-c', 'copy', '-y', output]);
+  if (result.status !== 0) ffmpeg('-i', input, '-c', 'copy', '-metadata:s:v', 'rotate=90', '-y', output);
+}
+
 async function withTempDirectory(fn) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'agvid-test-'));
   try { await fn(directory); }
@@ -271,7 +277,7 @@ test('probe reports displayed dimensions for a rotated video and frames are capp
     const plain = path.join(directory, 'plain.mp4');
     const rotated = path.join(directory, 'rotated.mp4');
     ffmpeg('-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=10:duration=2', '-c:v', 'mpeg4', '-y', plain);
-    ffmpeg('-display_rotation', '90', '-i', plain, '-c', 'copy', '-y', rotated);
+    rotate90(plain, rotated);
     const info = success('probe', rotated);
     assert.deepEqual([info.width, info.height, info.rotation, info.codedWidth, info.codedHeight], [180, 320, 90, 320, 180]);
     const output = success('frame', rotated, '--at', '1', '--output', path.join(directory, 'out'));
@@ -357,16 +363,21 @@ test('a long streamed WebM without duration metadata uses packet timestamps', as
   });
 });
 
-test('a video without stream duration fails with an actionable error', async () => {
+test('a raw elementary stream fails with advice that produces a usable video', async () => {
   await withTempDirectory(async (directory) => {
-    const source = path.join(directory, 'raw-video.m2v');
-    ffmpeg('-f', 'lavfi', '-i', 'testsrc2=size=160x90:rate=10:duration=1',
-      '-c:v', 'mpeg2video', '-f', 'mpeg2video', '-y', source);
-    const output = path.join(directory, 'out');
-    const result = invoke('overview', source, '--output', output);
-    assert.notEqual(result.status, 0);
-    assert.match(result.stderr, /video stream 0 has no duration metadata.*provide a video/i);
-    assert.deepEqual(await readdir(directory), ['raw-video.m2v']);
+    for (const [name, codec] of [['raw-video.m2v', ['-c:v', 'mpeg2video', '-f', 'mpeg2video']], ['raw-video.h264', ['-c:v', 'libx264', '-bf', '2', '-f', 'h264']]]) {
+      const source = path.join(directory, name);
+      ffmpeg('-f', 'lavfi', '-i', 'testsrc2=size=160x90:rate=10:duration=1', ...codec, '-y', source);
+      const output = path.join(directory, 'out');
+      const result = invoke('overview', source, '--output', output);
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /video stream 0 has no timestamps.*e\.g\. ffmpeg -r FPS -i VIDEO out\.mp4/);
+      assert.ok(!(await readdir(directory)).includes('out'));
+      const remuxed = path.join(directory, `${name}.mp4`);
+      ffmpeg('-r', '10', '-i', source, remuxed);
+      const info = success('probe', remuxed);
+      assert.deepEqual([info.start, info.end, info.frameCount], [0, 1, 10], name);
+    }
   });
 });
 
@@ -442,7 +453,7 @@ test('crop on a rotated source uses the displayed orientation', async () => {
     ffmpeg('-f', 'lavfi', '-i', 'color=blue:size=320x180:rate=10:duration=2',
       '-vf', 'drawbox=x=0:y=0:w=80:h=180:color=red:t=fill,drawbox=x=240:y=0:w=80:h=180:color=red:t=fill',
       '-c:v', 'mpeg4', '-q:v', '2', '-y', plain);
-    ffmpeg('-display_rotation', '90', '-i', plain, '-c', 'copy', '-y', rotated);
+    rotate90(plain, rotated);
     const output = success('frame', rotated, '--at', '1', '--crop', '0,0,1,0.25', '--output', path.join(directory, 'out'));
     const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
     assert.deepEqual(manifest.crop.pixels, { x: 0, y: 0, width: 180, height: 80, displayed: { width: 180, height: 80 } });
@@ -977,7 +988,7 @@ test('a video stream starting after the audio keeps container times across comma
   await withTempDirectory(async (directory) => {
     const source = path.join(directory, 'delayed.mp4');
     ffmpeg('-f', 'lavfi', '-i', 'sine=duration=5', '-itsoffset', '2', '-f', 'lavfi', '-i', HALF_FLIP,
-      '-map', '0:a', '-map', '1:v', '-c:a', 'aac', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', source);
+      '-map', '0:a', '-map', '1:v', '-c:a', 'aac', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-fps_mode', 'passthrough', '-y', source);
     const info = success('probe', source);
     assert.deepEqual([info.start, info.end, info.duration, info.containerStart], [2, 5, 3, 0]);
 
@@ -1132,7 +1143,7 @@ test('a one-frame stream keeps precise tick boundaries when its start rounds up 
     // A high movie timescale preserves the 1/60 s offset; ffprobe prints it as 0.016667 s.
     ffmpeg('-f', 'lavfi', '-i', 'anullsrc=sample_rate=48000:duration=0.05', '-itsoffset', String(1 / 60),
       '-f', 'lavfi', '-i', picture, '-map', '0:a', '-map', '1:v', '-c:a', 'aac', '-c:v', 'libx264',
-      '-pix_fmt', 'yuv420p', '-movie_timescale', '60000', '-y', delayed);
+      '-pix_fmt', 'yuv420p', '-movie_timescale', '60000', '-fps_mode', 'passthrough', '-y', delayed);
     ffmpeg('-f', 'lavfi', '-i', picture, '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-movie_timescale', '60000',
       '-output_ts_offset', String(1 / 60), '-y', shifted);
     for (const [source, start, at] of [[delayed, 1 / 60, 0.02], [shifted, 0, 0.01]]) {
@@ -1169,7 +1180,7 @@ test('anamorphic frames and crops are never enlarged, with or without rotation',
     // Red left and right quarters become the top and bottom bands after a 90 degree turn in either direction.
     ffmpeg('-f', 'lavfi', '-i', 'color=blue:size=160x90:rate=10:duration=1',
       '-vf', 'drawbox=x=0:y=0:w=40:h=90:color=red:t=fill,drawbox=x=120:y=0:w=40:h=90:color=red:t=fill,setsar=1/2', '-c:v', 'mpeg4', '-q:v', '2', '-y', plain);
-    ffmpeg('-display_rotation', '90', '-i', plain, '-c', 'copy', '-y', rotated);
+    rotate90(plain, rotated);
     for (const [source, crop, size, red] of [
       [plain, [], [80, 90]], [plain, ['--crop', '0,0,1,1'], [80, 90]], [plain, ['--crop', '0,0,0.25,1'], [20, 90], true],
       [rotated, [], [90, 80]], [rotated, ['--crop', '0,0,1,1'], [90, 80]], [rotated, ['--crop', '0,0,1,0.25'], [90, 20], true],
@@ -1213,7 +1224,7 @@ test('tail positions share one last-frame lookup, and an unusable lookup keeps t
     await mkdir(bin);
     // Logs tail lookups; with EMPTY set they list no packets, like a source without usable timestamps.
     await writeFile(path.join(bin, 'ffprobe'), `#!/bin/sh
-case " $* " in *" -show_entries packet=pts,dts,duration:stream=time_base "*) echo x >> "${calls}"; [ -n "$EMPTY" ] && exit 0;; esac
+case " $* " in *" -show_entries packet=pts,dts,duration,flags:stream=time_base "*) echo x >> "${calls}"; [ -n "$EMPTY" ] && exit 0;; esac
 exec "${real}" "$@"
 `);
     await chmod(path.join(bin, 'ffprobe'), 0o755);
@@ -1226,7 +1237,8 @@ exec "${real}" "$@"
 
     const failed = invokeIn({ env: { ...env, EMPTY: '1' } }, 'frame', source, '--at', '2.5', '--output', path.join(directory, 'failed'));
     assert.notEqual(failed.status, 0);
-    assert.match(failed.stderr, /ffmpeg exited/);
+    // FFmpeg 8 fails to open the encoder when no frame decodes; earlier versions exit 0 without writing one.
+    assert.match(failed.stderr, /ffmpeg exited|FFmpeg produced no frame for 2\.5s/);
     assert.doesNotMatch(failed.stderr, /Infinity|NaN/);
     assert.deepEqual((await readdir(directory)).sort(), ['bin', 'calls', 'one-fps.mp4', 'overview']);
   });
@@ -1377,5 +1389,36 @@ test('SIGTERM stops FFmpeg, removes the incomplete run and releases its director
       if (existing) assert.deepEqual(await readdir(output), []);
       else assert.ok(!(await readdir(directory)).includes('out'));
     }
+  });
+});
+
+test('a lock left by a killed run on this host is reclaimed by exactly one of several runs; live or foreign locks hold', async () => {
+  await withTempDirectory(async (directory) => {
+    const output = path.join(directory, 'out');
+    const lock = path.join(output, '.agvid.lock');
+    // The pid of a process that has exited.
+    const dead = spawnSync(process.execPath, ['-e', '']).pid;
+    assert.throws(() => process.kill(dead, 0), { code: 'ESRCH' });
+    await mkdir(output);
+    for (const owner of [`${process.pid}\n${os.hostname()}\n`, `${dead}\nanother-host\n`]) {
+      await writeFile(lock, owner);
+      const result = invoke('frame', video, '--at', '1', '--output', output);
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /in use by another agvid run/);
+      assert.deepEqual(await readdir(output), ['.agvid.lock']);
+    }
+    await writeFile(lock, `${dead}\n${os.hostname()}\n`);
+    const gate = await gatedFfmpeg(directory);
+    await gate.reset();
+    // The extraction waits until every rival has exited, so a second owner would never finish.
+    const runs = [0, 1, 2, 3].map(() => launch({ env: gate.env() }, 'frame', video, '--at', '1', '--output', output));
+    const settled = runs.map(() => undefined);
+    runs.forEach((run, i) => run.exited.then((result) => { settled[i] = result; }));
+    await until(async () => settled.filter(Boolean).length === 3 && (await gate.pids()).length === 1, 'three rivals to exit');
+    for (const result of settled.filter(Boolean)) assert.match(result.stderr, /in use by another agvid run/);
+    await gate.release();
+    const owner = (await Promise.all(runs.map((run) => run.exited))).find((result) => result.code === 0);
+    assert.equal(JSON.parse(owner.stdout).directory, output);
+    assert.deepEqual((await readdir(output)).sort(), ['frame-0000_00-01.000.jpg', 'manifest.json']);
   });
 });
