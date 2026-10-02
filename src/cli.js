@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, readdir, rename, rm, rmdir, stat, writeFile } from 'node:fs/promises';
+import { link, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -409,17 +409,21 @@ const LOCK = '.agvid.lock';
 // alone lets two runs share an existing empty directory; whichever creates the lock first owns it. A lock left by a
 // killed run on this host is replaced under an exclusively created LOCK.reclaim guard. A stale lock's owner is gone and
 // other runs need the guard to remove it, so the lock this run read as stale is still the one it removes. A lock found
-// missing is never removed: a run that does not take the guard may have created it since.
+// missing is never removed: a run that does not take the guard may have created it since. A guard left by a run killed
+// while holding it is removed by the next run that needs it, or that claims the directory.
 async function claim(directory) {
   const lock = path.join(directory, LOCK);
   const guard = `${lock}.reclaim`;
   const owner = `${process.pid}\n${os.hostname()}\n`;
   const create = (file) => writeFile(file, owner, { flag: 'wx' }).then(() => true,
     (error) => { if (error.code === 'EEXIST') return false; throw error; });
-  if (await create(lock)) return lock;
-  if (await create(guard)) {
+  if (await create(lock)) {
+    await removeStale(guard).catch(() => {});
+    return lock;
+  }
+  if (await create(guard) || (await removeStale(guard) && await create(guard))) {
     try {
-      const state = await lockState(lock);
+      const { state } = await readOwner(lock);
       if (state === 'stale') await rm(lock, { force: true });
       if (state !== 'held' && await create(lock)) return lock;
     } finally { await rm(guard, { force: true }); }
@@ -427,12 +431,38 @@ async function claim(directory) {
   throw Object.assign(new Error(`output directory is in use by another agvid run: ${directory} (delete ${LOCK} if no run is active)`), { inUse: true });
 }
 
-// 'missing', 'stale' (written on this host by a process that no longer exists) or 'held'. Locks from other hosts
-// (shared or container mounts), or unreadable ones, count as held.
-async function lockState(lock) {
-  let content;
-  try { content = await readFile(lock, 'utf8'); }
-  catch (error) { if (error.code === 'ENOENT') return 'missing'; throw error; }
+// Reads a lock file through one descriptor: its identity and its owner's state, 'missing', 'stale' or 'held'.
+async function readOwner(file) {
+  let handle;
+  try { handle = await open(file, 'r'); }
+  catch (error) { if (error.code === 'ENOENT') return { state: 'missing' }; throw error; }
+  try {
+    const info = await handle.stat();
+    return { identity: `${info.dev}:${info.ino}`, state: ownerState(await handle.readFile('utf8'), info.mtimeMs) };
+  } finally { await handle.close(); }
+}
+
+// Removes a lock file whose owner is gone and returns whether none is left. The file read is moved aside and checked to
+// be that same file; if another run replaced it meanwhile, the replacement is moved back. That fails only if a third
+// run created the name in the instants it was aside, so this is kept to guards, which exist for microseconds.
+async function removeStale(file) {
+  const { identity, state } = await readOwner(file);
+  if (state !== 'stale') return state === 'missing';
+  const aside = `${file}.${process.pid}`;
+  try { await rename(file, aside); }
+  catch (error) { if (error.code === 'ENOENT') return true; throw error; }
+  const moved = await stat(aside);
+  const same = `${moved.dev}:${moved.ino}` === identity;
+  if (!same) await link(aside, file).catch(() => {});
+  await rm(aside, { force: true });
+  return same;
+}
+
+// 'stale' when written on this host by a process that no longer exists, else 'held'. Lock files from other hosts
+// (shared or container mounts), or unreadable ones, count as held. A run writes its pid right after creating the file,
+// so one still empty after a minute belongs to a run killed in between.
+function ownerState(content, modified) {
+  if (!content) return Date.now() - modified > 60000 ? 'stale' : 'held';
   const [pid, host] = content.split('\n');
   if (!/^[1-9]\d*$/.test(pid) || host !== os.hostname()) return 'held';
   // This run's own pid can only be a reused pid of a finished run.

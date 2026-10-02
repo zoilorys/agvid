@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -1433,19 +1433,19 @@ test('a lock released while another run checks it for staleness is not replaced 
     await mkdir(sync);
     // This test process stands in for the live owner.
     await writeFile(lock, `${process.pid}\n${os.hostname()}\n`);
-    // The checking run's read of the lock waits for 'read', then its result waits for 'resume'.
+    // The checking run's opening of the lock waits for 'read', then its result waits for 'resume'.
     const hook = path.join(directory, 'hook.mjs');
     await writeFile(hook, `import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
-const readFile = fs.promises.readFile;
+const open = fs.promises.open;
 const step = async (signal, wait) => {
   fs.writeFileSync(${JSON.stringify(sync)} + '/' + signal, '');
   while (!fs.existsSync(${JSON.stringify(sync)} + '/' + wait)) await new Promise((resolve) => setTimeout(resolve, 10));
 };
-fs.promises.readFile = async (file, ...rest) => {
-  if (!String(file).endsWith('.agvid.lock')) return readFile(file, ...rest);
+fs.promises.open = async (file, ...rest) => {
+  if (!String(file).endsWith('.agvid.lock')) return open(file, ...rest);
   await step('reading', 'read');
-  const result = await readFile(file, ...rest).then((content) => ({ content }), (error) => ({ error }));
+  const result = await open(file, ...rest).then((content) => ({ content }), (error) => ({ error }));
   await step('checked', 'resume');
   if (result.error) throw result.error;
   return result.content;
@@ -1475,6 +1475,54 @@ syncBuiltinESMExports();
     assert.equal(await readFile(lock, 'utf8'), held);
     await gate.release();
     assert.equal((await newcomer.exited).code, 0);
+    assert.deepEqual((await readdir(output)).sort(), ['frame-0000_00-01.000.jpg', 'manifest.json']);
+  });
+});
+
+test('a reclaim guard left by a run killed while reclaiming is recovered by the next run', async () => {
+  await withTempDirectory(async (directory) => {
+    const output = path.join(directory, 'out');
+    const sync = path.join(directory, 'hold');
+    await mkdir(output);
+    await mkdir(sync);
+    const dead = spawnSync(process.execPath, ['-e', '']).pid;
+    await writeFile(path.join(output, '.agvid.lock'), `${dead}\n${os.hostname()}\n`);
+    // Holds the reclaiming run inside its guard: its opening of the stale lock never returns.
+    const hook = path.join(directory, 'hook.mjs');
+    await writeFile(hook, `import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+const open = fs.promises.open;
+fs.promises.open = async (file, ...rest) => {
+  if (String(file).endsWith('.agvid.lock')) { fs.writeFileSync(${JSON.stringify(path.join(sync, 'guarded'))}, ''); await new Promise(() => {}); }
+  return open(file, ...rest);
+};
+syncBuiltinESMExports();
+`);
+    const child = spawn(process.execPath, ['--import', pathToFileURL(hook).href, cli, 'frame', video, '--at', '1', '--output', output], { stdio: 'ignore' });
+    const killed = new Promise((resolve) => child.on('close', (code, signal) => resolve(signal)));
+    await until(() => stat(path.join(sync, 'guarded')).then(() => true, () => false), 'the reclaim guard');
+    child.kill('SIGKILL');
+    assert.equal(await killed, 'SIGKILL');
+    assert.deepEqual((await readdir(output)).sort(), ['.agvid.lock', '.agvid.lock.reclaim']);
+    const result = invoke('frame', video, '--at', '1', '--output', output);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual((await readdir(output)).sort(), ['frame-0000_00-01.000.jpg', 'manifest.json']);
+  });
+});
+
+test('an empty lock is held while fresh and reclaimed once a minute old', async () => {
+  await withTempDirectory(async (directory) => {
+    const output = path.join(directory, 'out');
+    const lock = path.join(output, '.agvid.lock');
+    await mkdir(output);
+    // A run killed between creating the lock and writing its pid leaves it empty.
+    await writeFile(lock, '');
+    const fresh = invoke('frame', video, '--at', '1', '--output', output);
+    assert.match(fresh.stderr, /in use by another agvid run/);
+    const old = new Date(Date.now() - 61000);
+    await utimes(lock, old, old);
+    const result = invoke('frame', video, '--at', '1', '--output', output);
+    assert.equal(result.status, 0, result.stderr);
     assert.deepEqual((await readdir(output)).sort(), ['frame-0000_00-01.000.jpg', 'manifest.json']);
   });
 });
