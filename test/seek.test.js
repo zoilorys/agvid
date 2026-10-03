@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -191,6 +191,58 @@ test('MPEG-PS and TS video delayed after audio keeps its span and images on the 
       const early = spawnSync(process.execPath, [cli, 'frame', video, '--at', String(info.start - 0.1), '--output', path.join(directory, 'early')], { encoding: 'utf8' });
       assert.match(early.stderr, /is before the video starts/);
     }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('long MPEG-PS/TS spans come from the tail, or from every packet when the tail holds no video keyframe', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'agvid-seek-'));
+  try {
+    // Black for 89 s, then white for the final second.
+    const source = "color=black:size=64x48:rate=25:duration=90,drawbox=color=white:t=fill:enable='gte(t,89)'";
+    const h264 = ['-c:v', 'libx264', '-bf', '2', '-pix_fmt', 'yuv420p'];
+    const fixtures = {
+      // Most packets lack pts, so the end comes from decoding the tail.
+      'tail.mpg': [],
+      // Audio outlasts the video by a minute, so the tail before the estimated end has no video.
+      'audio.ts': ['-f', 'lavfi', '-i', 'sine=duration=150', ...h264],
+      // One GOP: the tail has no keyframe.
+      'gop.ts': [...h264, '-g', '10000', '-x264-params', 'scenecut=0'],
+    };
+    for (const [name, args] of Object.entries(fixtures)) {
+      const video = path.join(directory, name);
+      run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', source, ...args, video]);
+      const info = JSON.parse(run(process.execPath, [cli, 'probe', video]));
+      assert.equal(info.durationSource, 'packets', name);
+      assert.ok(Math.abs(info.end - info.start - 90) < 1e-6, `${name} span ${info.start}-${info.end}`);
+      const tail = await output(directory, `${name}-tail`, 'frame', video, '--at', `${info.start + 88.9},${info.end - 0.01}`);
+      assert.ok(tail.levels[0] < 5 && tail.levels[1] > 245, `${name} ${tail.levels}`);
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('MPEG-PS decoded end falls back to the packet duration when showinfo logs no frame duration', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'agvid-seek-'));
+  try {
+    const video = path.join(directory, 'source.mpg');
+    run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', STEPS, video]);
+    // FFmpeg 5.1 logs showinfo frames without duration.
+    const real = run('sh', ['-c', 'command -v ffmpeg']).trim();
+    const bin = path.join(directory, 'bin');
+    await mkdir(bin);
+    await writeFile(path.join(bin, 'ffmpeg'), `#!${process.execPath}
+const { spawn } = require('node:child_process');
+const child = spawn(${JSON.stringify(real)}, process.argv.slice(2), { stdio: ['ignore', 'inherit', 'pipe'] });
+child.stderr.on('data', (chunk) => process.stderr.write(String(chunk).replace(/ duration: *\\d+ duration_time:\\S+/g, '')));
+child.on('close', (code) => { process.exitCode = code; });
+`);
+    await chmod(path.join(bin, 'ffmpeg'), 0o755);
+    const info = JSON.parse(run(process.execPath, [cli, 'probe', video],
+      { env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` } }));
+    assert.ok(Math.abs(info.end - 3) < 1e-6, `end ${info.end}`);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

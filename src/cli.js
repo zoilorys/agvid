@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, readdir, rename, rm, rmdir, stat, writeFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { link, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -35,8 +36,10 @@ that region at source resolution before --width scaling. Output is capped at the
 --video-stream N selects the zero-based video stream (0:v:N), default 0, on every command.
 Writes JPEG frames and manifest.json; overview, inspect and changes also write
 timecode-labeled sheet-NN.jpg. Output defaults to .agvid/runs/ under the git root (else cwd);
---output DIR must be new or empty; a run holds DIR/.agvid.lock until it ends, so a concurrent run on DIR fails.
-SIGINT/SIGTERM stop FFmpeg and remove the incomplete run's files. probe with several videos prints an array, with
+--output DIR must be new or empty; a run holds DIR/.agvid.lock until it ends, so a concurrent run on DIR fails
+(a killed run's lock is replaced).
+SIGINT/SIGTERM stop FFmpeg and remove the incomplete run's files. Raw elementary streams (no timestamps) are rejected.
+probe with several videos prints an array, with
 {video,error} entries for failures, and exits 1 if any failed.
 FFmpeg and FFprobe must be available on PATH.`;
 
@@ -199,7 +202,7 @@ function run(program, args) {
 
 async function probe(video, videoStream) {
   // Keep the full listing for audio presence and the container index of the selected video stream.
-  const raw = await run('ffprobe', ['-v', 'error', '-show_entries', 'format=start_time,format_name:stream=index,codec_type,width,height,avg_frame_rate,codec_name,start_pts,start_time,time_base,duration_ts,duration,nb_frames,pix_fmt,bits_per_raw_sample,sample_aspect_ratio:stream_side_data=rotation:stream_tags=DURATION,rotate', '-of', 'json', video]);
+  const raw = await run('ffprobe', ['-v', 'error', '-show_entries', 'format=start_time,duration,format_name:stream=index,codec_type,width,height,avg_frame_rate,codec_name,start_pts,start_time,time_base,duration_ts,duration,nb_frames,pix_fmt,bits_per_raw_sample,sample_aspect_ratio:stream_side_data=rotation:stream_tags=DURATION,rotate', '-of', 'json', video]);
   const { streams = [], format = {} } = JSON.parse(raw);
   const videoStreams = streams.filter((entry) => entry.codec_type === 'video');
   const stream = videoStreams[videoStream];
@@ -220,6 +223,7 @@ async function probe(video, videoStream) {
   let duration = ticksToSeconds(stream.duration_ts);
   if (!valid(duration)) duration = Number(stream.duration);
   let durationSource = 'stream';
+  let untimed = false;
   // FFmpeg's Matroska muxer writes DURATION as the endpoint on the raw stream timeline, including any start offset.
   if (!valid(duration) && stream.tags?.DURATION) {
     durationSource = 'tag';
@@ -230,19 +234,25 @@ async function probe(video, videoStream) {
   // last frames (stream and container alike), so those spans come from the packets. Other formats keep their metadata.
   const estimated = (format.format_name ?? '').split(',').some((name) => name === 'mpeg' || name === 'mpegts');
   if (!valid(duration) || estimated) {
-    const packets = await packetSpan(video, videoStream);
+    // The first pts comes from the head; the end from the tail past the container's estimated end.
+    const [head, packets] = await Promise.all([packetSpan(video, videoStream, '%+#32'),
+      tailPackets(video, videoStream, containerMicros / 1e6 + Number(format.duration))]);
     let { end } = packets;
     // With no pts at all (raw elementary streams) the timeline is synthetic: the span stays unknown.
-    if (Number.isFinite(packets.start) && !packets.exact) {
+    untimed = !Number.isFinite(head.start);
+    if (!untimed && !packets.exact) {
       // Packets without pts only bound the end from below; decode the tail for the frames' actual times.
-      const tail = await decodedTail(video, videoStream, packets.last - containerMicros / 1e6 - 1);
+      const tail = await decodedTail(video, videoStream, packets.last - containerMicros / 1e6 - 1, packets.lastDuration);
       if (tail.end > end || !Number.isFinite(end)) end = tail.end;
     }
-    if (valid(end - packets.start)) {
+    if (valid(end - head.start)) {
       durationSource = 'packets';
-      duration = end - packets.start;
-      streamStart = packets.start;
+      duration = end - head.start;
+      streamStart = head.start;
     }
+  }
+  if (!valid(duration) && untimed) {
+    throw new Error(`video stream ${videoStream} has no timestamps (a raw elementary stream?); re-encode it into a container first, e.g. ffmpeg -r FPS -i VIDEO out.mp4`);
   }
   if (!valid(duration)) {
     throw new Error(`video stream ${videoStream} has no duration metadata; provide a video with a known video-stream duration`);
@@ -303,17 +313,20 @@ function lines(program, args, from, consume) {
   });
 }
 
-// Demux-only scan of the video packets, in seconds on the stream timeline: first pts, display end, and last
-// presentation time. A packet without pts (reordered frames in AVI or MPEG-PS) counts at its dts, which is never
-// after its pts, so `exact` turns false and `end`/`last` become lower bounds.
-async function packetSpan(video, videoStream) {
+// Demux-only scan of the video packets, in seconds on the stream timeline: first pts, display end, last
+// presentation time and that packet's duration. A packet without pts (reordered frames in AVI or MPEG-PS) counts at
+// its dts, which is never after its pts, so `exact` turns false and `end`/`last` become lower bounds. `interval` is an
+// ffprobe -read_intervals value; `keyframe` tells whether a timed keyframe packet was read.
+async function packetSpan(video, videoStream, interval) {
   let first = Infinity;
   let last = -Infinity;
   let end = -Infinity;
+  let lastLength = NaN;
   let exact = true;
+  let keyframe = false;
   let timeBase;
-  await lines('ffprobe', ['-v', 'error', '-select_streams', `v:${videoStream}`,
-    '-show_entries', 'packet=pts,dts,duration:stream=time_base', '-of', 'compact', video], 'stdout', (line) => {
+  await lines('ffprobe', ['-v', 'error', '-select_streams', `v:${videoStream}`, ...(interval ? ['-read_intervals', interval] : []),
+    '-show_entries', 'packet=pts,dts,duration,flags:stream=time_base', '-of', 'compact', video], 'stdout', (line) => {
     timeBase = /^stream\|time_base=([1-9]\d*)\/([1-9]\d*)\|?$/.exec(line.trim())?.slice(1).map(Number) ?? timeBase;
     if (!line.startsWith('packet|')) return;
     const fields = Object.fromEntries(line.trim().split('|').slice(1).map((field) => field.split('=')));
@@ -323,18 +336,32 @@ async function packetSpan(video, videoStream) {
     if (!Number.isFinite(time)) return;
     if (Number.isFinite(pts)) first = Math.min(first, pts);
     else exact = false;
-    last = Math.max(last, time);
+    if (fields.flags?.startsWith('K')) keyframe = true;
     const length = ticks(fields.duration);
+    if (time > last) { last = time; lastLength = length; }
     if (Number.isFinite(length)) end = Math.max(end, time + length);
   });
   const seconds = (value) => (timeBase && Number.isFinite(value) ? value * timeBase[0] / timeBase[1] : NaN);
-  return { start: seconds(first), end: seconds(end), last: seconds(last), exact };
+  return { start: seconds(first), end: seconds(end), last: seconds(last), lastDuration: seconds(lastLength), exact, keyframe };
+}
+
+// Packets from TAIL_SCAN seconds before `rawEnd` (the expected end on the raw container timeline) to EOF bound the end
+// of the stream in time proportional to that tail. The frame shown last is decoded after the last keyframe, so a tail
+// holding a keyframe holds it too. Otherwise (the end was overestimated, or a GOP is longer) the whole file is scanned.
+const TAIL_SCAN = 30;
+
+async function tailPackets(video, videoStream, rawEnd) {
+  if (Number.isFinite(rawEnd)) {
+    const tail = await packetSpan(video, videoStream, `${rawEnd - TAIL_SCAN}%`);
+    if (tail.keyframe) return tail;
+  }
+  return packetSpan(video, videoStream);
 }
 
 // Decodes from `from` (container timeline seconds) to the end and returns the last decoded frame's presentation
 // time and display end, in seconds on the stream timeline: the timestamps FFmpeg extraction itself selects by.
-// NaN when nothing decodes.
-async function decodedTail(video, videoStream, from) {
+// NaN when nothing decodes. Frames without a showinfo duration (older FFmpeg) last `frameDuration` seconds.
+async function decodedTail(video, videoStream, from, frameDuration) {
   const scan = async (seek) => {
     let timeBase;
     let last = -Infinity;
@@ -343,12 +370,12 @@ async function decodedTail(video, videoStream, from) {
       '-i', video, '-map', `0:v:${videoStream}`, '-vf', 'showinfo', '-f', 'null', '-'], 'stderr', (line) => {
       if (!/Parsed_showinfo/.test(line)) return;
       timeBase = /\bconfig in time_base:\s*(\d+)\/(\d+)/.exec(line)?.slice(1).map(Number) ?? timeBase;
-      // Older showinfo logs no duration; the end then falls back to the frame's own time.
       const frame = /\bn:\s*\d+\s+pts:\s*(-?\d+)\s(?:.*?\bduration:\s*(\d+)\s)?/.exec(line);
       if (!frame || !timeBase?.[1]) return;
       const pts = Number(frame[1]) * timeBase[0] / timeBase[1];
+      const length = frame[2] === undefined ? frameDuration : Number(frame[2]) * timeBase[0] / timeBase[1];
       last = Math.max(last, pts);
-      end = Math.max(end, pts + Number(frame[2] ?? 0) * timeBase[0] / timeBase[1]);
+      end = Math.max(end, pts + (Number.isFinite(length) ? length : 0));
     });
     return { last, end };
   };
@@ -379,21 +406,151 @@ async function removeParents(directory, first) {
 
 const LOCK = '.agvid.lock';
 
-// Claims `directory` for this run with an exclusively created lock file. An emptiness check alone lets two runs
-// share an existing empty directory; whichever creates the lock first owns it.
+// Claims `directory` for this run with an exclusively created lock file holding its pid and host. An emptiness check
+// alone lets two runs share an existing empty directory; whichever creates the lock first owns it. A lock left by a
+// killed run on this host is replaced under a LOCK.reclaim directory containing a unique owner file. Recovery can
+// unlink a dead owner's specific file, but rmdir cannot remove a directory containing a live owner's file. A stale
+// lock's owner is gone and other runs need the guard to remove it, so the lock read as stale is still the one removed.
+// A lock found missing is never removed: a run that does not take the guard may have created it since.
 async function claim(directory) {
   const lock = path.join(directory, LOCK);
-  try { await writeFile(lock, `${process.pid}\n`, { flag: 'wx' }); }
-  catch (error) {
-    if (error.code === 'EEXIST') {
-      throw Object.assign(new Error(`output directory is in use by another agvid run: ${directory} (delete ${LOCK} if no run is active)`), { inUse: true });
-    }
-    throw error;
+  const guard = `${lock}.reclaim`;
+  const owner = `${process.pid}\n${os.hostname()}\n`;
+  const create = (file) => publish(file, owner, `${lock}.${randomUUID()}`);
+  if (await create(lock)) {
+    await recoverGuard(guard).catch(() => {});
+    return lock;
   }
-  return lock;
+  const releaseGuard = await acquireGuard(guard, owner) || (await recoverGuard(guard) && await acquireGuard(guard, owner));
+  if (releaseGuard) {
+    try {
+      const { state } = await readOwner(lock);
+      if (state === 'stale') await rm(lock, { force: true });
+      if (state !== 'held' && await create(lock)) return lock;
+    } finally { await releaseGuard(); }
+  }
+  throw Object.assign(new Error(`output directory is in use by another agvid run: ${directory} (delete ${LOCK} if no run is active)`), { inUse: true });
 }
 
-// Returns the claimed output directory: { directory, lock, created, firstParent }.
+// Creates `file` holding `content` unless it exists. The content is written to `staging` first and hard-linked into
+// place, so `file` never appears empty: a run stalled before writing cannot have its lock mistaken for a killed run's
+// and replaced, then carry on alongside the replacement. Filesystems without hard links (exFAT, FAT) intentionally fall
+// back to exclusive creation: there a run stalled over a minute between creating and writing its lock can still be
+// displaced. That needs an unusual stall, and failing such filesystems outright would be worse.
+async function publish(file, content, staging) {
+  await writeFile(staging, content, { flag: 'wx' });
+  try {
+    await link(staging, file);
+    return true;
+  } catch (error) {
+    if (error.code === 'EEXIST') return false;
+    if (!['EPERM', 'ENOTSUP', 'ENOSYS'].includes(error.code)) throw error;
+    return writeFile(file, content, { flag: 'wx' }).then(() => true,
+      (error) => { if (error.code === 'EEXIST') return false; throw error; });
+  } finally { await unlink(staging).catch(() => {}); }
+}
+
+// Reads a lock file through one descriptor: its owner's state, 'missing', 'stale' or 'held'.
+async function readOwner(file) {
+  let handle;
+  try { handle = await open(file, 'r'); }
+  catch (error) { if (error.code === 'ENOENT') return { state: 'missing' }; throw error; }
+  try {
+    const info = await handle.stat();
+    return { state: ownerState(await handle.readFile('utf8'), info.mtimeMs) };
+  } finally { await handle.close(); }
+}
+
+async function acquireGuard(directory, owner) {
+  try { await mkdir(directory); }
+  catch (error) { if (error.code === 'EEXIST') return undefined; throw error; }
+  const token = randomUUID();
+  const file = path.join(directory, token);
+  const release = async () => {
+    await unlink(file).catch((error) => { if (error.code !== 'ENOENT') throw error; });
+    await rmdir(directory).catch((error) => { if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error; });
+  };
+  try {
+    await publish(file, owner, `${directory}.${token}`);
+    // An empty guard may have been recovered and recreated between mkdir and writeFile. Only the sole owner may
+    // proceed. Its unique file keeps the directory nonempty until release; later arrivals see it and cannot win.
+    const files = await readdir(directory);
+    if (files.length === 1 && files[0] === token) return release;
+  } catch (error) {
+    if (error.code !== 'ENOENT') { await release(); throw error; }
+  }
+  await release();
+}
+
+async function recoverGuard(directory) {
+  let info;
+  try { info = await stat(directory); }
+  catch (error) { if (error.code === 'ENOENT') return true; throw error; }
+  if (!info.isDirectory()) {
+    // Older releases used a guard file. unlink cannot move or delete a replacement guard directory.
+    const { state } = await readOwner(directory).catch((error) => {
+      if (error.code === 'EISDIR') return { state: 'held' };
+      throw error;
+    });
+    if (state !== 'stale') return state === 'missing';
+    try { await unlink(directory); return true; }
+    catch (error) {
+      if (error.code === 'ENOENT') return true;
+      if (['EISDIR', 'EPERM'].includes(error.code)) return false;
+      throw error;
+    }
+  }
+  let files;
+  try { files = await readdir(directory); }
+  catch (error) { if (error.code === 'ENOENT') return true; throw error; }
+  // Allow a creator time to write its owner file. Recovery after that remains safe even if it resumes later.
+  if (!files.length && Date.now() - info.mtimeMs < 60000) return false;
+  for (const name of files) {
+    if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(name)) return false;
+    const file = path.join(directory, name);
+    const { state } = await readOwner(file);
+    if (state === 'held') return false;
+    // Owner filenames are never reused. A delayed recovery cannot unlink a newer owner's file.
+    if (state === 'stale') await unlink(file).catch((error) => { if (error.code !== 'ENOENT') throw error; });
+  }
+  try { await rmdir(directory); return true; }
+  catch (error) {
+    if (error.code === 'ENOENT') return true;
+    if (['ENOTEMPTY', 'EEXIST'].includes(error.code)) return false;
+    throw error;
+  }
+}
+
+// 'stale' when written on this host by a process that no longer exists, else 'held'. Lock files from other hosts
+// (shared or container mounts), or unreadable ones, count as held. Only older releases, or filesystems without hard
+// links, create a lock before writing its pid, so one still empty after a minute belongs to a run killed in between.
+function ownerState(content, modified) {
+  if (!content) return Date.now() - modified > 60000 ? 'stale' : 'held';
+  const [pid, host] = content.split('\n');
+  if (!/^[1-9]\d*$/.test(pid) || host !== os.hostname()) return 'held';
+  // This run's own pid can only be a reused pid of a finished run.
+  if (Number(pid) === process.pid) return 'stale';
+  try { process.kill(Number(pid), 0); return 'held'; }
+  catch (error) { return error.code === 'ESRCH' ? 'stale' : 'held'; }
+}
+
+const WORK = `${LOCK}.work-`;
+
+// Adds a work directory private to this run, where its FFmpeg writes. FFmpeg survives a SIGKILL of agvid and can keep
+// writing after the next run reclaims the lock, so finished files are moved into place only once this run's FFmpeg has
+// exited. Work directories left by killed runs are removed; an orphan writing there affects no other run.
+async function workspace(output) {
+  const { directory } = output;
+  const names = await readdir(directory).catch(() => []);
+  await Promise.all(names.filter((name) => name.startsWith(WORK))
+    .map((name) => rm(path.join(directory, name), { recursive: true, force: true, maxRetries: 3 }).catch(() => {})));
+  const work = path.join(directory, `${WORK}${randomUUID()}`);
+  try { await mkdir(work); }
+  catch (error) { await release(output, []); throw error; }
+  return { ...output, work };
+}
+
+// Returns the claimed output directory: { directory, lock, work, created, firstParent }.
 async function outputDirectory(video, command, requested) {
   if (requested) {
     const directory = path.resolve(requested);
@@ -404,16 +561,17 @@ async function outputDirectory(video, command, requested) {
       if (error.code !== 'EEXIST') { await removeParents(directory, firstParent); throw error; }
       created = false;
     }
-    // A competing run that claimed the directory first owns it, even if this run created it.
+    // A competing run that claimed the directory first owns it, even if this run created it. That run treats it as
+    // pre-existing, so if it fails the directory stays, empty; removing it here instead could race with its files.
     const lock = await claim(directory).catch(async (error) => {
       if (created && !error.inUse) await rmdir(directory).then(() => removeParents(directory, firstParent)).catch(() => {});
       throw error;
     });
-    if (!created && (await readdir(directory)).some((name) => name !== LOCK)) {
+    if (!created && (await readdir(directory)).some((name) => !name.startsWith(LOCK))) {
       await rm(lock, { force: true });
       throw new Error(`output directory is not empty: ${directory}`);
     }
-    return { directory, lock, created, firstParent: created ? firstParent : undefined };
+    return workspace({ directory, lock, created, firstParent: created ? firstParent : undefined });
   }
   const agvid = path.join(await findProjectRoot(process.cwd()), '.agvid');
   const root = path.join(agvid, 'runs');
@@ -433,12 +591,13 @@ async function outputDirectory(video, command, requested) {
       if (error.code === 'EEXIST') continue;
       throw error;
     }
-    return { directory, lock: await claim(directory), created: true };
+    return workspace({ directory, lock: await claim(directory), created: true });
   }
 }
 
 // Deletes this run's files, then its lock, then the directory and parents it created if nothing else is in them.
-async function release({ directory, lock, created, firstParent }, produced) {
+async function release({ directory, lock, work, created, firstParent }, produced) {
+  if (work) await rm(work, { recursive: true, force: true }).catch(() => {});
   await Promise.all(produced.map((file) => rm(file, { force: true }).catch(() => {})));
   await rm(lock, { force: true }).catch(() => {});
   if (created) await rmdir(directory).then(() => removeParents(directory, firstParent)).catch(() => {});
@@ -475,11 +634,10 @@ async function extract(video, info, time, width, filename, crop) {
   if (emptyError) throw emptyError;
 }
 
-// Time of the last video frame, from the largest packet pts in the file. Scan without seeking:
-// a demuxer can seek past a later-PTS packet that precedes the final B-frame in decode order.
+// Time of the last video frame, from the largest packet pts in the tail (see tailPackets).
 // When packets lack pts, decode the tail instead. Resolves NaN when no usable time is found.
 async function lastFrameTime(info) {
-  const packets = await packetSpan(info.video, info.videoStream);
+  const packets = await tailPackets(info.video, info.videoStream, info.containerStart + info.end);
   const last = packets.exact ? packets.last
     : (await decodedTail(info.video, info.videoStream, packets.last - info.containerStart - 1)).last;
   // The rounded container origin can be a fraction of a microsecond after this PTS; timeline zero still shows it.
@@ -860,7 +1018,7 @@ async function execute({ command, video, videos, options }) {
     if (times.length > 240) throw new Error('frame would create over 240 frames; reduce --at values');
   }
   const output = await outputDirectory(video, command, options.output);
-  const { directory } = output;
+  const { directory, work } = output;
   const frames = [];
   const produced = [];
   // Shared by every position that finds no frame, including concurrent ones.
@@ -868,7 +1026,7 @@ async function execute({ command, video, videos, options }) {
   const extractFrame = async (time, i) => {
     const timecode = formatTimecode(time);
     const filename = `frame-${String(i).padStart(4, '0')}_${timecode.replaceAll(':', '-')}.jpg`;
-    const target = path.join(directory, filename);
+    const target = path.join(work, filename);
     produced.push(target);
     let extractionError;
     try { await extract(video, info, time, width, target, crop); }
@@ -887,7 +1045,7 @@ async function execute({ command, video, videos, options }) {
     if (scores) frames.forEach((frame, i) => { frame.score = scores[i]; });
     let sheets;
     if (command !== 'frame' || frames.length > 1) {
-      const size = await frameSize(path.join(directory, frames[0].file));
+      const size = await frameSize(path.join(work, frames[0].file));
       sheets = [];
       const slices = windows ?? [{ frames: [0, frames.length - 1] }];
       const plans = slices.map((slice) => {
@@ -899,16 +1057,21 @@ async function execute({ command, video, videos, options }) {
       const digits = Math.max(2, String(plans.length).length);
       for (const [i, { slice, first, last, layout }] of plans.entries()) {
         const file = `sheet-${String(i + 1).padStart(digits, '0')}.jpg`;
-        produced.push(path.join(directory, file));
-        await writeSheet(directory, frames.slice(first, last + 1), file, layout, produced);
+        produced.push(path.join(work, file));
+        await writeSheet(work, frames.slice(first, last + 1), file, layout, produced);
         sheets.push({ file, frames: [first, last], start: frames[first].time, end: frames[last].time, ...layout });
         (slice.sheets ??= []).push(file);
       }
     }
     // No FFmpeg runs past here, so honor a cancellation that arrived during the last steps before committing.
     if (cancelled) throw cancellationError();
+    for (const file of [...frames.map((frame) => frame.file), ...(sheets ?? []).map((sheet) => sheet.file)]) {
+      produced.push(path.join(directory, file));
+      await rename(path.join(work, file), path.join(directory, file));
+    }
     produced.push(path.join(directory, 'manifest.json.tmp'), path.join(directory, 'manifest.json'));
     const manifest = await saveManifest(directory, { command, source: info, outputWidth: width, ...(crop ? { crop } : {}), ...(range && (options.start !== undefined || options.end !== undefined) ? { range } : {}), ...(detection ? { detection } : {}), frames, ...(windows ? { windows } : {}), ...(sheets ? { sheets } : {}) });
+    await rm(work, { recursive: true, force: true });
     await rm(output.lock, { force: true });
     console.log(JSON.stringify({ directory, ...(sheets ? { sheets: sheets.map((sheet) => path.join(directory, sheet.file)) } : {}), manifest, frames: frames.length, ...(detection ? { changes: frames.length - 1 } : {}) }, null, 2));
   } catch (error) {
