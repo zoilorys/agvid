@@ -265,3 +265,21 @@ test('sparse VFR images and change baselines show the frame on screen, not the n
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test('a time just before a frame shows the previous frame and keeps the change at that frame', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'agvid-seek-'));
+  try {
+    // Black until exactly 1 s, then white, at 25 fps.
+    const video = path.join(directory, 'edge.mp4');
+    run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i',
+      "color=black:size=64x48:rate=25:duration=2,drawbox=color=white:t=fill:enable='gte(t,1)'",
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', video]);
+    const frames = await output(directory, 'frames', 'frame', video, '--at', '0.99995,1');
+    assert.ok(frames.levels[0] < 5 && frames.levels[1] > 245, `frames ${frames.levels}`);
+    const changes = await output(directory, 'changes', 'changes', video, '--start', '0.99995', '--end', '2', '--min-gap', '0');
+    assert.deepEqual(changes.manifest.frames.map(({ time }) => time), [0.99995, 1]);
+    assert.ok(changes.levels[0] < 5 && changes.levels[1] > 245, `changes ${changes.levels}`);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});

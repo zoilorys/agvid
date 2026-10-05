@@ -613,9 +613,10 @@ function seekable(info, time) {
   return !info[SOURCE_FORMAT].split(',').includes('mpegts') && time >= info.start + ORIGIN_MARGIN;
 }
 
-// A time shows the frame on screen then: the last one whose pts is at most that time. The tolerance absorbs float
-// rounding between container-timeline seconds and source pts.
-const TIME_TOLERANCE = 1e-4;
+// A time shows the frame on screen then: the last one whose pts is at most that time. The tolerance absorbs only float
+// rounding between container-timeline seconds and source pts (about 1e-11 s at a day's timeline), far below a tick
+// of any stream time base (1/90000 s for MPEG), so no later frame counts as already shown.
+const TIME_TOLERANCE = 1e-9;
 // Frames before a time are first kept (scaled, encoded or piped) only from this long before it; a time with no frame
 // there (sparse VFR) retries with every earlier frame.
 const RECENT = 0.5;
