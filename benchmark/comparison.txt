@@ -1,0 +1,33 @@
+agvid final comparison (agvid-aoh.9). Wall seconds incl. Node startup, 3 runs/case, median [min-max].
+Host: Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz, 16 threads, 16 GiB, Darwin 25.6.0 x64, Node v24.21.0, FFmpeg 8.1.2 (same for both).
+Before: 2026-10-05T14:31:37.324Z cli=benchmark/baseline-src/bin/agvid.js cliTreeSha256=b09870bf18eb3ac9 load start 3.46/4.06/4.02 end 49.11/25.39/13.16
+After:  2026-10-05T22:14:17.548Z cli=bin/agvid.js cliTreeSha256=982dd1feb7073ba6 load start 4.79/7.27/6.87 end 18.04/11.23/8.47
+Shared desktop host; load differed (see above), so treat differences under ~10% or ~50 ms as noise.
+Commands: node scripts/benchmark.js --cli benchmark/baseline-src/bin/agvid.js --video bundled --video short --runs 3 --json benchmark/baseline.json
+          node scripts/benchmark.js --video bundled --video short --runs 3 --compare benchmark/baseline.json --json benchmark/after.json
+
+== bundled test/fixtures/test.mov 1280x800 60/1 25.583333s h264 sha256 11def39fdaf3ca38 (baseline same)
+case         before                  after                   after/before  frames before/after
+probe        0.231 [0.206-0.243]     0.210 [0.205-0.225]     x0.91         -/-
+overview12   1.096 [1.095-1.142]     0.859 [0.854-0.867]     x0.78         12/12
+overview48   3.290 [3.241-3.308]     2.244 [2.140-2.302]     x0.68         48/48
+frame1       0.378 [0.370-0.378]     0.382 [0.380-0.394]     x1.01         1/1
+frame5       0.628 [0.624-0.645]     0.520 [0.513-0.524]     x0.83         5/5
+inspect8     0.889 [0.882-1.028]     0.821 [0.746-0.846]     x0.92         8/8
+inspect100   6.401 [6.319-6.625]     1.938 [1.845-2.084]     x0.30         100/100
+changes      5.500 [5.463-5.600]     2.917 [2.914-2.986]     x0.53         36/36
+changesCrop  3.825 [3.788-3.964]     2.525 [2.472-2.571]     x0.66         32/32
+
+== short benchmark/.cache/testsrc2-1080p60-20s.mp4 1920x1080 60/1 20s h264 sha256 f29d0677b0472942 (baseline same)
+case         before                  after                   after/before  frames before/after
+probe        0.238 [0.220-0.238]     0.207 [0.201-0.213]     x0.87         -/-
+overview12   3.087 [2.713-3.142]     2.067 [2.013-2.068]     x0.67         12/12
+overview48   10.726 [10.721-11.144]  7.666 [7.333-7.864]     x0.71         48/48
+frame1       0.764 [0.741-0.843]     0.752 [0.707-0.763]     x0.98         1/1
+frame5       1.540 [1.447-1.611]     1.314 [1.298-1.383]     x0.85         5/5
+inspect8     2.136 [2.114-2.517]     0.836 [0.834-0.852]     x0.39         8/8
+inspect100   21.034 [21.015-21.893]  3.349 [3.279-3.680]     x0.16         100/100
+changes      13.053 [12.593-13.541]  8.264 [7.994-9.004]     x0.63         40/40
+changesCrop  8.637 [8.441-8.818]     6.963 [6.680-7.141]     x0.81         30/30
+
+Case definitions: probe=agvid probe <video>; overview12=agvid overview <video>; overview48=agvid overview <video> --frames 48; frame1=agvid frame <video> --at 7.5; frame5=agvid frame <video> --at 2,5,7.5,10,15; inspect8=agvid inspect <video> --around 7.5 --window 2s --fps 4; inspect100=agvid inspect <video> --start 0 --end 10 --fps 10; changes=agvid changes <video>; changesCrop=agvid changes <video> --crop 0,0,.5,.5

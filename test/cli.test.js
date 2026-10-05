@@ -4,7 +4,6 @@ import { spawn, spawnSync } from 'node:child_process';
 import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { formatTimecode } from '../src/cli.js';
 
 const video = path.resolve('test/fixtures/test.mov');
@@ -1216,8 +1215,9 @@ test('changes --max caps detected changes so the baseline keeps the run at 240 f
     const output = success('changes', source, '--min-gap', '0', '--max', '239', '--output', path.join(directory, 'out'));
     const manifest = await changesManifest(output);
     assert.deepEqual([output.frames, output.changes, manifest.detection.candidates, manifest.detection.truncated], [240, 239, 259, true]);
-    // Ties keep the earliest times.
-    assert.ok(Math.abs(manifest.frames.at(-1).time - 23.9) < 1e-6, String(manifest.frames.at(-1).time));
+    // Each of the 239 slices of the 26 s range holds a candidate, so the kept changes reach the last one.
+    assert.equal(manifest.detection.selection.fromSlices, 239);
+    assert.ok(Math.abs(manifest.frames.at(-1).time - 25.9) < 1e-6, String(manifest.frames.at(-1).time));
     const bad = invoke('changes', source, '--max', '240', '--output', path.join(directory, 'bad'));
     assert.match(bad.stderr, /--max must be an integer from 1 to 239/);
     assert.ok(!(await readdir(directory)).includes('bad'));
@@ -1374,7 +1374,7 @@ test('SIGTERM stops FFmpeg, removes the incomplete run and releases its director
   });
 });
 
-test('a lock left by a killed run on this host is reclaimed by exactly one of several runs; live or foreign locks hold', async () => {
+test('no lock is taken over automatically; once removed by hand exactly one of several runs owns the directory', async () => {
   await withTempDirectory(async (directory) => {
     const output = path.join(directory, 'out');
     const lock = path.join(output, '.agvid.lock');
@@ -1382,14 +1382,18 @@ test('a lock left by a killed run on this host is reclaimed by exactly one of se
     const dead = spawnSync(process.execPath, ['-e', '']).pid;
     assert.throws(() => process.kill(dead, 0), { code: 'ESRCH' });
     await mkdir(output);
-    for (const owner of [`${process.pid}\n${os.hostname()}\n`, `${dead}\nanother-host\n`]) {
+    const old = new Date(Date.now() - 3600000);
+    for (const owner of [`${dead}\n${os.hostname()}\n`, `${process.pid}\n${os.hostname()}\n`, `${dead}\nanother-host\n`, '']) {
       await writeFile(lock, owner);
+      await utimes(lock, old, old);
       const result = invoke('frame', video, '--at', '1', '--output', output);
       assert.notEqual(result.status, 0);
       assert.match(result.stderr, /in use by another agvid run/);
+      assert.ok(result.stderr.includes(`delete ${lock}`), result.stderr);
       assert.deepEqual(await readdir(output), ['.agvid.lock']);
+      assert.equal(await readFile(lock, 'utf8'), owner);
     }
-    await writeFile(lock, `${dead}\n${os.hostname()}\n`);
+    await rm(lock);
     const gate = await gatedFfmpeg(directory);
     await gate.reset();
     // The extraction waits until every rival has exited, so a second owner would never finish.
@@ -1405,285 +1409,7 @@ test('a lock left by a killed run on this host is reclaimed by exactly one of se
   });
 });
 
-test('a lock released while another run checks it for staleness is not replaced over a new owner', async () => {
-  await withTempDirectory(async (directory) => {
-    const output = path.join(directory, 'out');
-    const lock = path.join(output, '.agvid.lock');
-    const sync = path.join(directory, 'hold');
-    await mkdir(output);
-    await mkdir(sync);
-    // This test process stands in for the live owner.
-    await writeFile(lock, `${process.pid}\n${os.hostname()}\n`);
-    // The checking run's opening of the lock waits for 'read', then its result waits for 'resume'.
-    const hook = path.join(directory, 'hook.mjs');
-    await writeFile(hook, `import fs from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
-const open = fs.promises.open;
-const step = async (signal, wait) => {
-  fs.writeFileSync(${JSON.stringify(sync)} + '/' + signal, '');
-  while (!fs.existsSync(${JSON.stringify(sync)} + '/' + wait)) await new Promise((resolve) => setTimeout(resolve, 10));
-};
-fs.promises.open = async (file, ...rest) => {
-  if (!String(file).endsWith('.agvid.lock')) return open(file, ...rest);
-  await step('reading', 'read');
-  const result = await open(file, ...rest).then((content) => ({ content }), (error) => ({ error }));
-  await step('checked', 'resume');
-  if (result.error) throw result.error;
-  return result.content;
-};
-syncBuiltinESMExports();
-`);
-    const child = spawn(process.execPath, ['--import', pathToFileURL(hook).href, cli, 'frame', video, '--at', '1', '--output', output],
-      { stdio: ['ignore', 'pipe', 'pipe'] });
-    let stderr = '';
-    child.stderr.on('data', (chunk) => { stderr += chunk; });
-    const checker = new Promise((resolve) => child.on('close', (code) => resolve(code)));
-    const signaled = (name) => stat(path.join(sync, name)).then(() => true, () => false);
-    await until(() => signaled('reading'), 'the staleness check');
-    // The owner releases its lock just before the check reads it, and a new run claims the directory right after,
-    // holding it while it extracts.
-    await rm(lock);
-    await writeFile(path.join(sync, 'read'), '');
-    await until(() => signaled('checked'), 'the lock read');
-    const gate = await gatedFfmpeg(directory);
-    await gate.reset();
-    const newcomer = launch({ env: gate.env() }, 'frame', video, '--at', '1', '--output', output);
-    await until(async () => (await gate.pids()).length === 1, 'the new owner extraction');
-    const held = await readFile(lock, 'utf8');
-    await writeFile(path.join(sync, 'resume'), '');
-    assert.notEqual(await checker, 0);
-    assert.match(stderr, /in use by another agvid run/);
-    assert.equal(await readFile(lock, 'utf8'), held);
-    await gate.release();
-    assert.equal((await newcomer.exited).code, 0);
-    assert.deepEqual((await readdir(output)).sort(), ['frame-0000_00-01.000.jpg', 'manifest.json']);
-  });
-});
-
-test('stale guard recovery cannot displace a live reclaimer while it checks the stale lock', async () => {
-  await withTempDirectory(async (directory) => {
-    const output = path.join(directory, 'out');
-    const sync = path.join(directory, 'hold');
-    const lock = path.join(output, '.agvid.lock');
-    const guard = `${lock}.reclaim`;
-    await mkdir(output);
-    await mkdir(sync);
-    const dead = spawnSync(process.execPath, ['-e', '']).pid;
-    const stale = `${dead}\n${os.hostname()}\n`;
-    const hook = path.join(directory, 'hook.mjs');
-    await writeFile(hook, `import fs from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
-const root = ${JSON.stringify(sync)};
-const step = async (signal, wait) => {
-  fs.writeFileSync(root + '/' + signal, '');
-  while (!fs.existsSync(root + '/' + wait)) await new Promise((resolve) => setTimeout(resolve, 10));
-};
-const open = fs.promises.open;
-fs.promises.open = async (file, ...rest) => {
-  const handle = await open(file, ...rest);
-  const read = handle.readFile.bind(handle);
-  handle.readFile = async (...args) => {
-    const content = await read(...args);
-    if (process.env.ROLE === 'A' && String(file).includes('.agvid.lock.reclaim')) await step('A-read', 'A-resume');
-    if (process.env.ROLE === 'B' && String(file).endsWith('.agvid.lock')) await step('B-read', 'B-resume');
-    return content;
-  };
-  return handle;
-};
-const rename = fs.promises.rename;
-fs.promises.rename = async (from, to) => {
-  await rename(from, to);
-  if (process.env.ROLE === 'A' && String(from).endsWith('.reclaim')) await step('A-moved', 'A-finish');
-};
-const rmdir = fs.promises.rmdir;
-let heldEmpty = false;
-fs.promises.rmdir = async (file, ...rest) => {
-  if (process.env.ROLE === 'A' && process.env.FORMAT === 'empty' && String(file).endsWith('.reclaim') && !heldEmpty) {
-    heldEmpty = true;
-    await step('A-read', 'A-resume');
-  }
-  return rmdir(file, ...rest);
-};
-const mkdir = fs.promises.mkdir;
-fs.promises.mkdir = async (file, ...rest) => {
-  const result = await mkdir(file, ...rest);
-  if (process.env.ROLE === 'A' && process.env.FORMAT === 'publishing' && String(file).endsWith('.reclaim')) await step('A-read', 'A-resume');
-  return result;
-};
-syncBuiltinESMExports();
-`);
-    const gate = await gatedFfmpeg(directory);
-    // Also cover a creator resuming after its empty directory was recovered, before it published its owner file.
-    for (const format of ['file', 'directory', 'empty', 'publishing']) {
-      await rm(sync, { recursive: true, force: true });
-      await mkdir(sync);
-      await gate.reset();
-      await writeFile(lock, stale);
-      if (format === 'file') await writeFile(guard, stale);
-      else if (format !== 'publishing') {
-        await mkdir(guard);
-        if (format === 'directory') await writeFile(path.join(guard, '00000000-0000-4000-8000-000000000000'), stale);
-        else {
-          const old = new Date(Date.now() - 61000);
-          await utimes(guard, old, old);
-        }
-      }
-      const signaled = (name) => stat(path.join(sync, name)).then(() => true, () => false);
-      const runs = [];
-      const start = (role) => {
-        const run = launch({ env: gate.env({ ROLE: role, FORMAT: format, NODE_OPTIONS: `--import=${pathToFileURL(hook).href}` }) },
-          'frame', video, '--at', '1', '--width', '160', '--output', output);
-        runs.push(run);
-        return run;
-      };
-      try {
-        const a = start('A');
-        let aResult;
-        a.exited.then((result) => { aResult = result; });
-        await until(() => signaled('A-read'), `${format}: A reads the stale guard`);
-        if (format === 'publishing') {
-          const old = new Date(Date.now() - 61000);
-          await utimes(guard, old, old);
-        }
-        const b = start('B');
-        await until(() => signaled('B-read'), `${format}: B owns the replacement guard and reads the stale lock`);
-        await writeFile(path.join(sync, 'A-resume'), '');
-        await until(async () => aResult || await signaled('A-moved'), `${format}: A attempts recovery`);
-        const c = start('C');
-        let cResult;
-        c.exited.then((result) => { cResult = result; });
-        await until(async () => cResult || (await gate.pids()).length > 0, `${format}: C attempts to claim`);
-        assert.ok(cResult, `${format}: C acquired the directory while B held the reclaim guard`);
-        assert.notEqual(cResult.code, 0);
-        assert.match(cResult.stderr, /in use by another agvid run/);
-        await writeFile(path.join(sync, 'A-finish'), '');
-        assert.notEqual((await a.exited).code, 0);
-        await writeFile(path.join(sync, 'B-resume'), '');
-        await until(async () => (await gate.pids()).length === 1, `${format}: B extracts alone`);
-        assert.equal((await readFile(lock, 'utf8')).split('\n')[0], String(b.child.pid));
-        await gate.release();
-        const result = await b.exited;
-        assert.equal(result.code, 0, result.stderr);
-        const manifest = JSON.parse(await readFile(path.join(output, 'manifest.json'), 'utf8'));
-        assert.deepEqual(manifest.frames.map(({ time }) => time), [1]);
-        jpegInfo(path.join(output, manifest.frames[0].file));
-        assert.deepEqual((await readdir(output)).sort(), [manifest.frames[0].file, 'manifest.json'].sort());
-      } finally {
-        await gate.release();
-        for (const run of runs) run.child.kill('SIGKILL');
-        await Promise.all(runs.map((run) => run.exited));
-      }
-      await rm(output, { recursive: true, force: true });
-      await mkdir(output);
-    }
-  });
-});
-
-test('a reclaim guard left by a run killed while reclaiming is recovered by the next run', async () => {
-  await withTempDirectory(async (directory) => {
-    const output = path.join(directory, 'out');
-    const sync = path.join(directory, 'hold');
-    await mkdir(output);
-    await mkdir(sync);
-    const dead = spawnSync(process.execPath, ['-e', '']).pid;
-    await writeFile(path.join(output, '.agvid.lock'), `${dead}\n${os.hostname()}\n`);
-    // Holds the reclaiming run inside its guard: its opening of the stale lock never returns.
-    const hook = path.join(directory, 'hook.mjs');
-    await writeFile(hook, `import fs from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
-const open = fs.promises.open;
-fs.promises.open = async (file, ...rest) => {
-  if (String(file).endsWith('.agvid.lock')) {
-    fs.writeFileSync(${JSON.stringify(path.join(sync, 'guarded'))}, '');
-    await new Promise(() => { setInterval(() => {}, 1000); });
-  }
-  return open(file, ...rest);
-};
-syncBuiltinESMExports();
-`);
-    const child = spawn(process.execPath, ['--import', pathToFileURL(hook).href, cli, 'frame', video, '--at', '1', '--output', output], { stdio: 'ignore' });
-    const killed = new Promise((resolve) => child.on('close', (code, signal) => resolve(signal)));
-    await until(() => stat(path.join(sync, 'guarded')).then(() => true, () => false), 'the reclaim guard');
-    child.kill('SIGKILL');
-    assert.equal(await killed, 'SIGKILL');
-    assert.deepEqual((await readdir(output)).sort(), ['.agvid.lock', '.agvid.lock.reclaim']);
-    const result = invoke('frame', video, '--at', '1', '--output', output);
-    assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual((await readdir(output)).sort(), ['frame-0000_00-01.000.jpg', 'manifest.json']);
-  });
-});
-
-test('an empty lock is held while fresh and reclaimed once a minute old', async () => {
-  await withTempDirectory(async (directory) => {
-    const output = path.join(directory, 'out');
-    const lock = path.join(output, '.agvid.lock');
-    await mkdir(output);
-    // An older release, or one on a filesystem without hard links, killed between creating the lock and writing its pid.
-    await writeFile(lock, '');
-    const fresh = invoke('frame', video, '--at', '1', '--output', output);
-    assert.match(fresh.stderr, /in use by another agvid run/);
-    const old = new Date(Date.now() - 61000);
-    await utimes(lock, old, old);
-    const result = invoke('frame', video, '--at', '1', '--output', output);
-    assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual((await readdir(output)).sort(), ['frame-0000_00-01.000.jpg', 'manifest.json']);
-  });
-});
-
-test('a run stalled for over a minute while claiming a directory never shares it with a run that claimed it meanwhile', async () => {
-  await withTempDirectory(async (directory) => {
-    const output = path.join(directory, 'out');
-    const sync = path.join(directory, 'hold');
-    await mkdir(output);
-    await mkdir(sync);
-    // A's exclusive creation of its lock file pauses between creating the file and writing its owner.
-    const hook = path.join(directory, 'hook.mjs');
-    await writeFile(hook, `import fs from 'node:fs';
-import { syncBuiltinESMExports } from 'node:module';
-const root = ${JSON.stringify(sync)};
-const writeFile = fs.promises.writeFile;
-fs.promises.writeFile = async (file, data, options) => {
-  if (!String(file).startsWith(${JSON.stringify(path.join(output, '.agvid.lock'))}) || options?.flag !== 'wx') return writeFile(file, data, options);
-  const handle = await fs.promises.open(file, 'wx');
-  fs.writeFileSync(root + '/created', String(file));
-  while (!fs.existsSync(root + '/resume')) await new Promise((resolve) => setTimeout(resolve, 10));
-  try { await handle.writeFile(data); } finally { await handle.close(); }
-};
-syncBuiltinESMExports();
-`);
-    const gate = await gatedFfmpeg(directory);
-    await gate.reset();
-    const a = spawn(process.execPath, ['--import', pathToFileURL(hook).href, cli, 'frame', video, '--at', '1', '--output', output],
-      { env: gate.env(), stdio: ['ignore', 'pipe', 'pipe'] });
-    let stderr = '';
-    a.stderr.on('data', (chunk) => { stderr += chunk; });
-    let aCode;
-    const aExited = new Promise((resolve) => a.on('close', (code) => resolve(aCode = code)));
-    try {
-      await until(() => stat(path.join(sync, 'created')).then(() => true, () => false), 'A creating its lock');
-      const old = new Date(Date.now() - 61000);
-      const created = await readFile(path.join(sync, 'created'), 'utf8');
-      await utimes(created, old, old);
-      const b = launch({ env: gate.env() }, 'frame', video, '--at', '1', '--output', output);
-      await until(async () => (await gate.pids()).length === 1, 'B extracting');
-      await writeFile(path.join(sync, 'resume'), '');
-      await until(async () => aCode !== undefined || (await gate.pids()).length > 1, 'A resuming');
-      assert.notEqual(aCode, undefined, 'A extracted into the directory B owns');
-      assert.notEqual(aCode, 0);
-      assert.match(stderr, /in use by another agvid run/);
-      await gate.release();
-      const result = await b.exited;
-      assert.equal(result.code, 0, result.stderr);
-      assert.deepEqual((await readdir(output)).sort(), ['frame-0000_00-01.000.jpg', 'manifest.json']);
-    } finally {
-      await gate.release();
-      a.kill('SIGKILL');
-      await aExited;
-    }
-  });
-});
-
-test('FFmpeg left running by a killed run cannot write into the run that reclaims its directory', async () => {
+test('a killed run keeps its directory until cleared by hand, and its surviving FFmpeg cannot write into the next run', async () => {
   await withTempDirectory(async (directory) => {
     const output = path.join(directory, 'out');
     await mkdir(output);
@@ -1694,7 +1420,15 @@ test('FFmpeg left running by a killed run cannot write into the run that reclaim
     const [orphan] = await gate.pids();
     killed.child.kill('SIGKILL');
     await killed.exited;
-    // Its FFmpeg survives; the next run reclaims the directory and finishes first.
+    const left = (await readdir(output)).sort();
+    assert.equal(left.length, 2);
+    assert.equal(left[0], '.agvid.lock');
+    assert.match(left[1], /^\.agvid\.lock\.work-/);
+    const refused = invoke('frame', video, '--at', '1', '--output', output);
+    assert.match(refused.stderr, /in use by another agvid run/);
+    assert.deepEqual((await readdir(output)).sort(), left);
+    // The user clears the killed run by hand, as the error advises, while its FFmpeg still waits to write.
+    for (const name of left) await rm(path.join(output, name), { recursive: true });
     const result = await launch({ env: gate.env({ PASS: '2' }) }, 'frame', video, '--at', '1', '--width', '160', '--output', output).exited;
     assert.equal(result.code, 0, result.stderr);
     await gate.release();

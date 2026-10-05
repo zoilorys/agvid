@@ -1,0 +1,246 @@
+{
+  "environment": {
+    "date": "2026-10-05T22:14:17.548Z",
+    "node": "v24.21.0",
+    "ffmpeg": "ffmpeg version 8.1.2 Copyright (c) 2000-2026 the FFmpeg developers",
+    "ffprobe": "ffprobe version 8.1.2 Copyright (c) 2007-2026 the FFmpeg developers",
+    "os": "Darwin 25.6.0 x64",
+    "cpu": "Intel(R) Core(TM) i9-9880H CPU @ 2.30GHz",
+    "cpus": 16,
+    "memoryGiB": 16,
+    "loadavgAtStart": [
+      4.79,
+      7.27,
+      6.87
+    ],
+    "gitHead": "df223bf427284fb6cbad89fe29a87b8ef9eb843d",
+    "gitDirty": true,
+    "cli": "bin/agvid.js",
+    "cliTreeSha256": "982dd1feb7073ba6d72eaddd4bc534a76be54ca67f47e14ccee9b19f156a0d48",
+    "loadavgAtEnd": [
+      18.04,
+      11.23,
+      8.47
+    ]
+  },
+  "runs": 3,
+  "cases": {
+    "probe": "agvid probe <video>",
+    "overview12": "agvid overview <video>",
+    "overview48": "agvid overview <video> --frames 48",
+    "frame1": "agvid frame <video> --at 7.5",
+    "frame5": "agvid frame <video> --at 2,5,7.5,10,15",
+    "inspect8": "agvid inspect <video> --around 7.5 --window 2s --fps 4",
+    "inspect100": "agvid inspect <video> --start 0 --end 10 --fps 10",
+    "changes": "agvid changes <video>",
+    "changesCrop": "agvid changes <video> --crop 0,0,.5,.5"
+  },
+  "videos": [
+    {
+      "name": "bundled",
+      "file": "test/fixtures/test.mov",
+      "sha256": "11def39fdaf3ca38b0c5cbed4a60b7dca6d0bfa15689755bc54e59d5ede160e9",
+      "bytes": 8261286,
+      "duration": 25.583333,
+      "codec_name": "h264",
+      "width": 1280,
+      "height": 800,
+      "r_frame_rate": "60/1",
+      "nb_frames": "1361",
+      "results": {
+        "probe": {
+          "median": 0.21,
+          "min": 0.2046,
+          "times": [
+            0.2046,
+            0.2253,
+            0.21
+          ]
+        },
+        "overview12": {
+          "median": 0.8587,
+          "min": 0.854,
+          "times": [
+            0.8668,
+            0.854,
+            0.8587
+          ],
+          "frames": 12
+        },
+        "overview48": {
+          "median": 2.2442,
+          "min": 2.1405,
+          "times": [
+            2.2442,
+            2.1405,
+            2.3024
+          ],
+          "frames": 48
+        },
+        "frame1": {
+          "median": 0.3817,
+          "min": 0.3799,
+          "times": [
+            0.3799,
+            0.3817,
+            0.3935
+          ],
+          "frames": 1
+        },
+        "frame5": {
+          "median": 0.5204,
+          "min": 0.5131,
+          "times": [
+            0.5238,
+            0.5204,
+            0.5131
+          ],
+          "frames": 5
+        },
+        "inspect8": {
+          "median": 0.8205,
+          "min": 0.7456,
+          "times": [
+            0.8205,
+            0.7456,
+            0.846
+          ],
+          "frames": 8
+        },
+        "inspect100": {
+          "median": 1.9382,
+          "min": 1.8455,
+          "times": [
+            2.0838,
+            1.8455,
+            1.9382
+          ],
+          "frames": 100
+        },
+        "changes": {
+          "median": 2.9172,
+          "min": 2.9141,
+          "times": [
+            2.9172,
+            2.9141,
+            2.9862
+          ],
+          "frames": 36
+        },
+        "changesCrop": {
+          "median": 2.5254,
+          "min": 2.4724,
+          "times": [
+            2.5715,
+            2.5254,
+            2.4724
+          ],
+          "frames": 32
+        }
+      }
+    },
+    {
+      "name": "short",
+      "file": "benchmark/.cache/testsrc2-1080p60-20s.mp4",
+      "sha256": "f29d0677b04729420d63d22819c720be68d59bed9bb8e70a4f9364211668f771",
+      "bytes": 22075620,
+      "duration": 20,
+      "codec_name": "h264",
+      "width": 1920,
+      "height": 1080,
+      "r_frame_rate": "60/1",
+      "nb_frames": "1200",
+      "results": {
+        "probe": {
+          "median": 0.2071,
+          "min": 0.2012,
+          "times": [
+            0.2126,
+            0.2071,
+            0.2012
+          ]
+        },
+        "overview12": {
+          "median": 2.0675,
+          "min": 2.0128,
+          "times": [
+            2.0675,
+            2.0128,
+            2.0685
+          ],
+          "frames": 12
+        },
+        "overview48": {
+          "median": 7.6659,
+          "min": 7.3335,
+          "times": [
+            7.6659,
+            7.8642,
+            7.3335
+          ],
+          "frames": 48
+        },
+        "frame1": {
+          "median": 0.7517,
+          "min": 0.7067,
+          "times": [
+            0.7067,
+            0.7517,
+            0.7633
+          ],
+          "frames": 1
+        },
+        "frame5": {
+          "median": 1.3143,
+          "min": 1.2985,
+          "times": [
+            1.2985,
+            1.3143,
+            1.3825
+          ],
+          "frames": 5
+        },
+        "inspect8": {
+          "median": 0.8355,
+          "min": 0.8344,
+          "times": [
+            0.8344,
+            0.8355,
+            0.8519
+          ],
+          "frames": 8
+        },
+        "inspect100": {
+          "median": 3.3495,
+          "min": 3.2792,
+          "times": [
+            3.2792,
+            3.6797,
+            3.3495
+          ],
+          "frames": 100
+        },
+        "changes": {
+          "median": 8.2637,
+          "min": 7.9944,
+          "times": [
+            9.0041,
+            8.2637,
+            7.9944
+          ],
+          "frames": 40
+        },
+        "changesCrop": {
+          "median": 6.9633,
+          "min": 6.6799,
+          "times": [
+            6.6799,
+            7.1414,
+            6.9633
+          ],
+          "frames": 30
+        }
+      }
+    }
+  ]
+}

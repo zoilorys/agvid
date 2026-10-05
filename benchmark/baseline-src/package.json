@@ -1,0 +1,37 @@
+{
+  "name": "agvid",
+  "version": "0.1.0",
+  "description": "Video frames and metadata for coding agents",
+  "license": "MIT",
+  "author": "Illia Puzanov",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zoilorys/agvid.git"
+  },
+  "homepage": "https://github.com/zoilorys/agvid#readme",
+  "bugs": "https://github.com/zoilorys/agvid/issues",
+  "keywords": [
+    "video",
+    "ffmpeg",
+    "frames",
+    "cli",
+    "agents"
+  ],
+  "type": "module",
+  "bin": {
+    "agvid": "bin/agvid.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "skill",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}
