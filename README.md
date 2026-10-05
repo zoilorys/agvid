@@ -10,24 +10,89 @@ Install Node.js 20 or newer, plus FFmpeg. Then install the CLI:
 npm install -g agvid
 ```
 
-For a checkout, run `npm link` from the repository root. The package also includes an agent skill at `skill/agvid/SKILL.md`. To install the skill for Codex, copy that directory into `~/.codex/skills/`.
+For a checkout, run `npm link` from the repository root.
+
+### Install the agent skill
+
+The package includes an agent skill at `skill/agvid/SKILL.md`. Copy it for your agent:
+
+```sh
+# Claude Code, user scope
+mkdir -p ~/.claude/skills && cp -R "$(npm root -g)/agvid/skill/agvid" ~/.claude/skills/
+
+# Claude Code, project scope (run from the project root)
+mkdir -p .claude/skills && cp -R "$(npm root -g)/agvid/skill/agvid" .claude/skills/
+
+# Codex
+mkdir -p ~/.codex/skills && cp -R "$(npm root -g)/agvid/skill/agvid" ~/.codex/skills/
+```
+
+Run these with the same Node and npm that installed agvid, since nvm and Volta keep global packages per version or tool. If the path is missing, find `agvid/skill/agvid` in your version manager's package directory.
+
+From a checkout, symlink instead so the skill tracks the repository (run from the repository root). This replaces any existing copy or link:
+
+```sh
+mkdir -p ~/.claude/skills && rm -rf ~/.claude/skills/agvid && ln -s "$PWD/skill/agvid" ~/.claude/skills/agvid
+```
 
 ## Inspect a video
 
 ```sh
 agvid probe video.mov
-agvid overview --frames 12 video.mov
+agvid overview video.mov
 agvid inspect video.mov --around 00:07.5 --window 2s --fps 4
 agvid frame video.mov --at 00:07.5 --width 320
+agvid changes recording.mov --crop 0.5,0,0.5,0.5
+agvid probe a.mov b.mov
+agvid probe --video-stream 1 multi-track.mov
+agvid overview multi-track.mov --video-stream 1
 ```
 
-`overview` samples evenly across the video and writes `contact-sheet.jpg`, individual JPEG frames, and `manifest.json`. `inspect` samples the centered window at the requested frame rate. `frame` extracts one JPEG. `probe` prints source metadata as JSON.
+`overview` samples evenly across the video. `inspect` samples the centered window at the requested frame rate. `changes` finds moments where the picture changes (see below). All three write JPEG frames, `manifest.json`, and sheets `sheet-01.jpg`, … (at most 1568 px per side, split across several sheets when needed; `sheet-001.jpg`, … from 100 sheets), with each tile labeled bottom-left with its timecode. `frame` extracts JPEGs and no sheet, except a sheet when `--at` lists several times. Frame files are named like `frame-0003_00-07.500.jpg`. `probe` prints source metadata as JSON: the video stream's `start`, `end` and `duration` on the timeline (with `durationSource`; MPEG-PS and MPEG-TS spans come from a packet scan because FFmpeg's duration estimate for them can stop short; it reads the 30 s before that estimate to the end, or the whole file when those hold no video keyframe), `containerStart`, displayed and coded size, `sar` (sample aspect ratio, rotation-adjusted), rotation, fps, frame count, codec, pixel format, bit depth, and audio presence. With several videos it prints an array in argument order; a video that fails becomes `{ "video": "/abs/path", "error": "..." }` and the exit code is 1.
 
-Frame width defaults to 640 pixels. Use `--width PX` on image commands to reduce size. Use `--output DIR` to choose a directory. By default, each run gets a fresh directory under `./agvid-output/`. The command prints the output paths as JSON. The manifest maps each frame filename to a source timestamp in seconds.
+### Select a video stream
 
-`--window` is the total duration, so `--around 00:07.5 --window 2s` covers roughly 6.5 to 8.5 seconds. The window clips at the start or end of the video. `inspect` caps output at 240 frames; `overview` accepts 1 to 64 frames.
+All commands accept `--video-stream N`. `N` is the zero-based video-stream ordinal used by FFmpeg's `0:v:N`, not the absolute stream index in the container. The default is `0`. For example, use `--video-stream 1` when the first video stream is cover art and the second is the footage. `probe --video-stream 1 a.mov b.mov` applies the same choice to both files; a file without that video stream gets an error entry. `probe` reports `videoStream` and `streamIndex` (the absolute container index). Image manifests record both in `source`.
 
-FFmpeg seeking can land on a nearby decoded frame, depending on the source codec. Use the timestamps as requested positions, not frame accuracy guarantees.
+### Timeline
+
+All times are seconds on the container timeline, as players and `ffmpeg -ss` show them: 0 is the container start (`probe` reports its raw timestamp as `containerStart`). The selected video stream spans `start` to `end` on it; `start` is above 0 when, for example, audio begins before the video. Overview and changes default to that span, `--start/--end` are clamped to it, and `--at`/`--around` outside it are errors. A time shows the frame on screen then, as a player would: the last frame at or before it. Manifest times are the requested times, or for `changes` the exact source frame times.
+
+### Ranges
+
+`overview`, `inspect` and `changes` accept `--start TIME` and `--end TIME` (seconds, `MM:SS.s`, or `HH:MM:SS.s`) to work on part of the video. Clock minute and second fields must be below 60. `--start` and `--end` are clamped to the video span; `--start` must be before its end. For `inspect`, `--start/--end` replace `--around/--window` (combining them is an error). The manifest gets `range: { start, end }` when either is passed.
+
+### Batching
+
+`--at` (frame) and `--around` (inspect) take a comma list or repeated flags: `--at 1,4.5 --at 9`. `--at` times are deduped and sorted. Each `--around` gets its own window, sheets, and an entry in the manifest `windows[]` (`around`, `start`, `end`, `frames` as `[first, last]` indexes into `frames`, `sheets`; `around` is `null` for `--start/--end`). A run is capped at 240 frames.
+
+### Crop
+
+`--crop x,y,w,h` (frame, inspect, overview, changes) takes fractions 0 to 1 of the displayed frame: left, top, width, height, with the origin at the top left. Estimate them from a sheet tile: a button about 80% across and 40% down the tile, roughly 15% wide and 20% tall, is `--crop 0.8,0.4,0.15,0.2`. The region is cut at source resolution before `--width` scaling and is never enlarged, so small text becomes legible. It must fit in the frame and be at least 16x16 source pixels. The manifest `crop` holds the fractions and `pixels`: the even stored-pixel `x`, `y`, `width`, `height` given to the crop filter, and `displayed`, its size in square pixels (SAR applied to the coded horizontal axis, then rotated).
+
+### Find changes
+
+```sh
+agvid changes recording.mov
+```
+
+`changes` decodes the range once, samples at up to 30 fps by default, and writes the range start plus each frame where more than `--threshold` of the picture (default 0.002) differs from the last detected candidate, at least `--min-gap` (default 0.5s) apart. It compares RGB pixels at 256 pixels wide, at most 512x512 pixels in area so tall crops shrink to fit, and counts a pixel when any channel differs by more than 16/255. This catches color changes with similar brightness. `--analysis-fps` accepts 1 to 60; `--analysis-width` accepts 64 to 512. Higher values catch shorter or smaller changes but take more decode time. `--max` (default 48, up to 239, so the run stays within 240 frames with the baseline) caps detected changes, keeping the highest scores and the earliest times on ties. The printed JSON adds `changes`, the number of frames after the first. In the manifest, each frame has a `score` (`null` for the range start, the baseline), and `detection` records the actual `metric`, `analysis` size (`width`, `height`, `fps`), `threshold`, `minGap`, `candidates` found, and `truncated` (more candidates than `--max`). Change times are exact source frame times from integer timestamps. Sheets are split as for `inspect`.
+
+- Needs FFmpeg 5.1 or newer (it uses `-fps_mode`).
+- A moving cursor-sized box stays below the default threshold. Use `--crop` around a region of interest, or lower `--threshold`, to catch small UI changes.
+- `changes` decodes the whole range: use `--start/--end` on long videos.
+
+### Options and output
+
+`overview` defaults to 12 frames. Frame width defaults to a 640 pixel cap; `--width PX` accepts 64 to 4096 and preserves aspect ratio. Output never exceeds the displayed width of the frame or crop in square pixels: SAR applied to the coded horizontal axis, then rotated, so a 160x90 source with SAR 1:2 is at most 80x90, or 90x80 when rotated 90 degrees. Options accept `--key value` or `--key=value`. By default each run gets a fresh directory `.agvid/runs/<video>-<command>[-N]/` under the git root, else the current directory; `.agvid/` ignores itself in git. `--output DIR` must be new or empty; a run holds `DIR/.agvid.lock` until it ends, so a concurrent run on the same directory fails. A lock whose run was killed (its pid is gone on this host) is replaced by the next run. Failed runs, and runs stopped with Ctrl-C or SIGTERM, stop FFmpeg and delete their own files and any directory they created. The command prints JSON with `directory`, `sheets`, `manifest`, and the frame count. The manifest maps each frame file to its requested source `time` in seconds and `timecode`, and each sheet to its frame range and grid.
+
+`--window` defaults to 2 seconds and is the total duration, so `--around 00:07.5 --window 2s` covers roughly 6.5 to 8.5 seconds. The window clips at the start or end of the video. `--fps` defaults to 4. `inspect` caps output at 240 frames; `overview` accepts 1 to 64 frames.
+
+Frames are evidence for a moment, not frame accurate: FFmpeg seeking can land on a nearby decoded frame, depending on the source codec. Manifest times keep the requested precision; filenames and sheet labels round to milliseconds. AVI stores no timestamps for reordered (B-) frames, so FFmpeg rebuilds them from decode order: in such files `changes` can report a cut at 1 s as 1.04 s. Extraction uses the same timestamps, so that time still shows the changed frame.
+
+Raw elementary streams (`.h264`, `.m2v`) have no timestamps and are rejected. Re-encode them into a container first: `ffmpeg -r FPS -i video.h264 video.mp4`.
+
+MPEG-TS files decode from the container start because fast seeking can skip frames. Other formats retry from the start if fast seeking produces no frames. Late timestamps can take longer; change analysis still stops at the requested range end.
 
 ## Develop
 
