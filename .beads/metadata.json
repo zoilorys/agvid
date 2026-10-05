@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "agvid",
+  "project_id": "3579568f-a02f-486a-9c7c-a879f03d89a0"
+}
