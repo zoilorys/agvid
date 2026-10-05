@@ -49,12 +49,11 @@ async function invoke(directory, video, command, ...args) {
   return { manifest, levels };
 }
 
-test('B-frame TS extraction shows the requested next frame and final display interval', async () => {
+test('B-frame TS extraction shows the frame on screen and final display interval', async () => {
   await withTransportStream(async ({ directory, video }) => {
     const { manifest, levels } = await invoke(directory, video, 'frame', '--at', '0,0.5,2,2.5');
     assert.deepEqual(manifest.frames.map(({ time }) => time), [0, 0.5, 2, 2.5]);
-    assert.ok(levels[0] < 5, `baseline ${levels[0]}`);
-    assert.ok(levels[1] > 115 && levels[1] < 140, `interior ${levels[1]}`);
+    assert.ok(levels[0] < 5 && levels[1] < 5, `before the gray frame ${levels.slice(0, 2)}`);
     assert.ok(levels[2] > 245 && levels[3] > 245, `final frame ${levels.slice(2)}`);
   });
 });
@@ -68,12 +67,12 @@ test('B-frame TS change analysis pairs exact source times with full and cropped 
       `full range ${full.levels}`);
     await rm(path.join(directory, 'changes'), { recursive: true });
     const ranged = await invoke(directory, video, 'changes', '--start', '0.5', '--end', '2.5', '--crop', '0.5,0,0.5,1', '--min-gap', '0');
-    assert.equal(ranged.manifest.frames.length, 2);
-    ranged.manifest.frames.forEach(({ time }, i) => assert.ok(Math.abs(time - [0.5, 2][i]) < 1e-9, `range time ${time}`));
-    assert.ok(ranged.levels[0] > 115 && ranged.levels[0] < 140 && ranged.levels[1] > 245, `cropped range ${ranged.levels}`);
-    assert.ok(ranged.manifest.frames[1].score > 0.99);
+    assert.equal(ranged.manifest.frames.length, 3);
+    ranged.manifest.frames.forEach(({ time }, i) => assert.ok(Math.abs(time - [0.5, 1, 2][i]) < 1e-9, `range time ${time}`));
+    assert.ok(ranged.levels[0] < 5 && ranged.levels[1] > 115 && ranged.levels[1] < 140 && ranged.levels[2] > 245, `cropped range ${ranged.levels}`);
+    assert.ok(ranged.manifest.frames[2].score > 0.99);
     const image = JSON.parse(run('ffprobe', ['-v', 'error', '-show_entries', 'stream=width,height', '-of', 'json',
-      path.join(directory, 'changes', ranged.manifest.frames[1].file)]));
+      path.join(directory, 'changes', ranged.manifest.frames[2].file)]));
     assert.deepEqual(image.streams[0], { width: 32, height: 48 });
   });
 });
@@ -82,7 +81,7 @@ test('multi-GOP TS preserves early images and changes when input seeking would s
   await withTransportStream(async ({ directory, video }) => {
     const frames = await invoke(directory, video, 'frame', '--at', '0,0.5,2,3,5.5');
     assert.deepEqual(frames.manifest.frames.map(({ time }) => time), [0, 0.5, 2, 3, 5.5]);
-    assert.ok(frames.levels[0] < 5 && frames.levels[1] > 115 && frames.levels[1] < 140
+    assert.ok(frames.levels[0] < 5 && frames.levels[1] < 5
       && frames.levels[2] > 115 && frames.levels[2] < 140 && frames.levels[3] > 245 && frames.levels[4] > 245,
     `requested images ${frames.levels}`);
     const changes = await invoke(directory, video, 'changes', '--min-gap', '0');
@@ -92,9 +91,9 @@ test('multi-GOP TS preserves early images and changes when input seeking would s
       `detected images ${changes.levels}`);
     await rm(path.join(directory, 'changes'), { recursive: true });
     const ranged = await invoke(directory, video, 'changes', '--start', '0.5', '--end', '4', '--min-gap', '0');
-    assert.equal(ranged.manifest.frames.length, 2);
-    ranged.manifest.frames.forEach(({ time }, i) => assert.ok(Math.abs(time - [0.5, 3][i]) < 1e-9, `range time ${time}`));
-    assert.ok(ranged.levels[0] > 115 && ranged.levels[0] < 140 && ranged.levels[1] > 245, `ranged images ${ranged.levels}`);
+    assert.equal(ranged.manifest.frames.length, 3);
+    ranged.manifest.frames.forEach(({ time }, i) => assert.ok(Math.abs(time - [0.5, 1, 3][i]) < 1e-9, `range time ${time}`));
+    assert.ok(ranged.levels[0] < 5 && ranged.levels[1] > 115 && ranged.levels[1] < 140 && ranged.levels[2] > 245, `ranged images ${ranged.levels}`);
   }, true);
 });
 
@@ -243,6 +242,43 @@ child.on('close', (code) => { process.exitCode = code; });
     const info = JSON.parse(run(process.execPath, [cli, 'probe', video],
       { env: { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` } }));
     assert.ok(Math.abs(info.end - 3) < 1e-6, `end ${info.end}`);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('sparse VFR images and change baselines show the frame on screen, not the next stored one', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'agvid-seek-'));
+  try {
+    // Stored frames only at 0 s (black), 1 s (gray) and 9 s (white), as screen recorders write a static screen.
+    const video = path.join(directory, 'vfr.mp4');
+    run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i',
+      "color=black:size=64x48:rate=1:duration=10,drawbox=color=gray:t=fill:enable='between(t,1,8)',drawbox=color=white:t=fill:enable='gte(t,9)'",
+      '-vf', "select='eq(n,0)+eq(n,1)+eq(n,9)'", '-fps_mode', 'vfr', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', video]);
+    const frames = await output(directory, 'frames', 'frame', video, '--at', '0.5,5,8.9,9.5');
+    assert.ok(frames.levels[0] < 5 && frames.levels[1] > 115 && frames.levels[1] < 140
+      && frames.levels[2] > 115 && frames.levels[2] < 140 && frames.levels[3] > 245, `frames ${frames.levels}`);
+    const changes = await output(directory, 'changes', 'changes', video, '--start', '5', '--min-gap', '0');
+    assert.deepEqual(changes.manifest.frames.map(({ time }) => time), [5, 9]);
+    assert.ok(changes.levels[0] > 115 && changes.levels[0] < 140 && changes.levels[1] > 245, `changes ${changes.levels}`);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('a time just before a frame shows the previous frame and keeps the change at that frame', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'agvid-seek-'));
+  try {
+    // Black until exactly 1 s, then white, at 25 fps.
+    const video = path.join(directory, 'edge.mp4');
+    run('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i',
+      "color=black:size=64x48:rate=25:duration=2,drawbox=color=white:t=fill:enable='gte(t,1)'",
+      '-c:v', 'libx264', '-pix_fmt', 'yuv420p', video]);
+    const frames = await output(directory, 'frames', 'frame', video, '--at', '0.99995,1');
+    assert.ok(frames.levels[0] < 5 && frames.levels[1] > 245, `frames ${frames.levels}`);
+    const changes = await output(directory, 'changes', 'changes', video, '--start', '0.99995', '--end', '2', '--min-gap', '0');
+    assert.deepEqual(changes.manifest.frames.map(({ time }) => time), [0.99995, 1]);
+    assert.ok(changes.levels[0] < 5 && changes.levels[1] > 245, `changes ${changes.levels}`);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

@@ -56,7 +56,7 @@ All commands accept `--video-stream N`. `N` is the zero-based video-stream ordin
 
 ### Timeline
 
-All times are seconds on the container timeline, as players and `ffmpeg -ss` show them: 0 is the container start (`probe` reports its raw timestamp as `containerStart`). The selected video stream spans `start` to `end` on it; `start` is above 0 when, for example, audio begins before the video. Overview and changes default to that span, `--start/--end` are clamped to it, and `--at`/`--around` outside it are errors. A time between two frames shows the next frame; a time after the last frame shows the last one. Manifest times are the requested times, or for `changes` the exact source frame times.
+All times are seconds on the container timeline, as players and `ffmpeg -ss` show them: 0 is the container start (`probe` reports its raw timestamp as `containerStart`). The selected video stream spans `start` to `end` on it; `start` is above 0 when, for example, audio begins before the video. Overview and changes default to that span, `--start/--end` are clamped to it, and `--at`/`--around` outside it are errors. A time shows the frame on screen then, as a player would: the last frame at or before it. Manifest times are the requested times, or for `changes` the exact source frame times.
 
 ### Ranges
 

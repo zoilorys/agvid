@@ -27,7 +27,7 @@ DURATION accepts seconds, with optional s suffix. Manifest times keep sub-millis
 filenames and sheet labels round to milliseconds.
 Times are on the container timeline (0 is the container start, as in players and ffmpeg -ss); probe start/end
 give the selected video stream's span on it, which may begin after 0. --start/--end are clamped to that span;
---at and --around must fall inside it. A time between frames shows the next frame, or the last one at the end.
+--at and --around must fall inside it. A time shows the frame on screen then: the last one at or before it.
 --start/--end cannot combine with --around/--window.
 --crop takes fractions 0-1 of the displayed frame (left, top, width, height) and cuts
 that region at source resolution before --width scaling. Output is capped at the displayed width
@@ -54,6 +54,7 @@ const OPTIONS = {
 const MULTI = new Set(['at', 'around']);
 // Internal demuxer metadata controls seeking; symbol keys stay out of probe JSON and manifests.
 const SOURCE_FORMAT = Symbol('sourceFormat');
+const TICK = Symbol('tick');
 
 export function parseTime(value) {
   const parts = String(value).replace(/s$/, '').split(':');
@@ -276,7 +277,7 @@ async function probe(video, videoStream) {
   const sar = swap ? 1 / storedSar : storedSar;
   const relativeStart = streamStart - containerMicros / 1e6;
   // Clipping a first PTS just before the rounded container origin to zero must not extend the stream's end.
-  return { [SOURCE_FORMAT]: format.format_name ?? '', video, videoStream, streamIndex: stream.index, start: Math.max(0, relativeStart), end: relativeStart + duration, duration,
+  return { [SOURCE_FORMAT]: format.format_name ?? '', [TICK]: ticksToSeconds(1), video, videoStream, streamIndex: stream.index, start: Math.max(0, relativeStart), end: relativeStart + duration, duration,
     containerStart: containerMicros / 1e6, width: swap ? stream.height : stream.width, height: swap ? stream.width : stream.height,
     sar, rotation, codedWidth: stream.width, codedHeight: stream.height, fps, frameRate: stream.avg_frame_rate ?? null,
     frameCount, frameCountEstimated, codec: stream.codec_name, pixelFormat: stream.pix_fmt ?? null,
@@ -612,36 +613,50 @@ function seekable(info, time) {
   return !info[SOURCE_FORMAT].split(',').includes('mpegts') && time >= info.start + ORIGIN_MARGIN;
 }
 
+// A time shows the frame on screen then: the last one whose pts is at most that time. The tolerance absorbs only float
+// rounding between container-timeline seconds and source pts (about 1e-11 s at a day's timeline), far below a tick
+// of any stream time base (1/90000 s for MPEG), so no later frame counts as already shown.
+const TIME_TOLERANCE = 1e-9;
+// Frames before a time are first kept (scaled, encoded or piped) only from this long before it; a time with no frame
+// there (sparse VFR) retries with every earlier frame.
+const RECENT = 0.5;
+
+// Decode attempts for the frame on screen at `time`: input seeking where it is reliable, then from the origin.
+// Other demuxers can seek past the initial keyframe's DTS, so an attempt that finds no frame falls through.
+function attempts(info, time) {
+  return [...(seekable(info, time) ? [false] : []), true].flatMap((slow) => [{ slow, window: RECENT }, { slow, window: Infinity }]);
+}
+
+// Seeks with -noaccurate_seek and -copyts so decoding starts at the keyframe before `time` on source pts. Output -ss
+// would count from the stream's own rebased start in MPEG-PS/TS (wrong for a delayed video stream).
+function seekArgs(slow, time) {
+  return slow ? ['-copyts'] : ['-noaccurate_seek', '-copyts', '-ss', String(time)];
+}
+
+// Ends decoding just past `end` (source seconds). trim rounds to the nearest tick, so it ends a tick late; callers
+// cut at the exact time themselves.
+function trimEnd(info, end) {
+  return `trim=end=${end + (Number.isFinite(info[TICK]) ? info[TICK] : 0.1) + TIME_TOLERANCE}`;
+}
+
 async function extract(video, info, time, width, filename, crop) {
   const cut = crop ? `crop=${crop.pixels.width}:${crop.pixels.height}:${crop.pixels.x}:${crop.pixels.y},` : '';
+  const target = time + info.containerStart + TIME_TOLERANCE;
   let emptyError;
-  for (const slow of seekable(info, time) ? [false, true] : [true]) {
-    // Other demuxers can seek past the initial keyframe's DTS. Retry from the origin if that produced no frame.
-    // Output -ss would count from the stream's own rebased start in MPEG-PS/TS (wrong for a delayed video stream),
-    // so the origin decode keeps source pts and trims at the absolute time, as change analysis does.
-    const input = slow ? ['-copyts', '-i', video] : ['-ss', String(time), '-i', video];
-    const trim = slow ? `trim=start=${time + info.containerStart},` : '';
+  // A time before the first decoded frame (AVI rebuilds pts from dts, delaying it) shows that first frame.
+  for (const { slow, window } of [...attempts(info, time), { slow: true, window: 0 }]) {
+    const select = window === 0 ? '' : `${trimEnd(info, target)},select='${Number.isFinite(window) ? `between(t,${target - window},${target})` : `lte(t,${target})`}',`;
     try {
-      await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', ...input, '-map', `0:v:${info.videoStream}`, '-frames:v', '1', '-vf', `${trim}${cut}scale=${width}:max(2\\,round(${width}/dar/2)*2),setsar=1`, '-threads:v', '1', '-q:v', '4', '-y', filename]);
+      // image2 -update rewrites the file per kept frame, leaving the last one at or before `time`.
+      await run('ffmpeg', ['-hide_banner', '-loglevel', 'error', ...seekArgs(slow, time), '-i', video, '-map', `0:v:${info.videoStream}`, ...(window === 0 ? ['-frames:v', '1'] : []), '-vf', `${select}${cut}scale=${width}:max(2\\,round(${width}/dar/2)*2),setsar=1`, '-update', '1', '-threads:v', '1', '-q:v', '4', '-y', filename]);
     } catch (error) {
       // FFmpeg 8 can fail to initialize MJPEG at EOF when seeking yielded no decoded frame.
       if (await nonempty(filename) || !/Non full-range YUV[\s\S]*Could not open encoder before EOF/.test(error.message)) throw error;
-      error.emptyFrame = true;
       emptyError ??= error;
     }
     if (await nonempty(filename)) return;
   }
   if (emptyError) throw emptyError;
-}
-
-// Time of the last video frame, from the largest packet pts in the tail (see tailPackets).
-// When packets lack pts, decode the tail instead. Resolves NaN when no usable time is found.
-async function lastFrameTime(info) {
-  const packets = await tailPackets(info.video, info.videoStream, info.containerStart + info.end);
-  const last = packets.exact ? packets.last
-    : (await decodedTail(info.video, info.videoStream, packets.last - info.containerStart - 1)).last;
-  // The rounded container origin can be a fraction of a microsecond after this PTS; timeline zero still shows it.
-  return Number.isFinite(last) ? Math.max(0, last - info.containerStart) : NaN;
 }
 
 const ANALYSIS_FPS = 30;
@@ -653,7 +668,7 @@ const PENDING_BYTES = 16 * 1024 * 1024;
 
 // One decode pass over the range: RGB source frames thinned to at most analysisFps/s (select keeps source pts;
 // no fps resampling), each scored as the share of pixels with any channel differing by more than 16/255 from the last reported frame
-// (initially the first decoded one, at the range start). -copyts keeps source pts; times come from showinfo's integer
+// (initially the one on screen at the range start). -copyts keeps source pts; times come from showinfo's integer
 // pts and time base, since its pts_time can be rounded (%.6g in FFmpeg 5.1). Passing such a time to -ss selects that frame:
 // FFmpeg truncates -ss to microseconds, at or before the pts, then rounds it to the nearest tick of the stream time base.
 // Streams rawvideo; keeps only the reference frame and frames still waiting for their pts line.
@@ -674,7 +689,7 @@ function analysisSize(analysisWidth, sourceWidth, sourceHeight) {
   return { width, height };
 }
 
-function detectChanges(video, info, range, crop, settings, slow = !seekable(info, range.start)) {
+function detectChanges(video, info, range, crop, settings, attempt = 0) {
   const { threshold, minGap, max, analysisFps, analysisWidth } = settings;
   const { width, height } = analysisSize(analysisWidth, crop?.pixels.width ?? info.width, crop?.pixels.height ?? info.height);
   const pixels = width * height;
@@ -682,11 +697,17 @@ function detectChanges(video, info, range, crop, settings, slow = !seekable(info
   // Frames normally wait at most a pipe read for their showinfo time; a longer queue means pairing broke.
   const maxPending = Math.max(8, Math.min(64, Math.floor(PENDING_BYTES / size)));
   const cut = crop ? `crop=${crop.pixels.width}:${crop.pixels.height}:${crop.pixels.x}:${crop.pixels.y},` : '';
-  const seek = slow ? [] : ['-ss', String(range.start)];
-  // With copyts, trimming must use absolute source PTS and precede select/showinfo to keep frame/time pairing intact.
-  const trim = slow ? `trim=start=${range.start + info.containerStart}:end=${range.end + info.containerStart},` : '';
-  const args = ['-hide_banner', '-nostats', '-loglevel', 'info', '-copyts', ...seek, '-to', String(range.end), '-i', video,
-    '-map', `0:v:${info.videoStream}`, '-vf', `${trim}${cut}select='isnan(prev_selected_t)+gte(t-prev_selected_t,${1 / analysisFps - 1e-6})',scale=${width}:${height},format=rgb24,showinfo`,
+  const plan = attempts(info, range.start);
+  const { slow, window } = plan[attempt];
+  const retry = attempt + 1 < plan.length;
+  // The baseline is the frame on screen at the range start, so frames up to it pass (from `window` before it);
+  // the last becomes the reference. Later frames are thinned to analysisFps. With copyts, trimming must use absolute
+  // source PTS and precede select/showinfo to keep frame/time pairing intact.
+  const startPts = range.start + info.containerStart + TIME_TOLERANCE;
+  const before = Number.isFinite(window) ? `gte(t,${startPts - window})` : '1';
+  const select = `if(lte(t,${startPts}),${before},isnan(prev_selected_t)+gte(t-prev_selected_t,${1 / analysisFps - 1e-6}))`;
+  const args = ['-hide_banner', '-nostats', '-loglevel', 'info', ...seekArgs(slow, range.start), '-i', video,
+    '-map', `0:v:${info.videoStream}`, '-vf', `${trimEnd(info, range.end + info.containerStart)},${cut}select='${select}',scale=${width}:${height},format=rgb24,showinfo`,
     '-fps_mode', 'passthrough', '-threads:v', '1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'];
   return new Promise((resolve, reject) => {
     const child = start('ffmpeg', args);
@@ -695,7 +716,8 @@ function detectChanges(video, info, range, crop, settings, slow = !seekable(info
     const events = [];
     let candidates = 0;
     const errors = [];
-    let decoded = 0;
+    // Set when this attempt found no frame at or before the range start; the next attempt replaces it.
+    let missed = false;
     let failed;
     let reference;
     let lastReport = range.start;
@@ -713,12 +735,16 @@ function detectChanges(video, info, range, crop, settings, slow = !seekable(info
       return changed / pixels;
     };
     const drain = () => {
-      while (pendingFrames.length && pendingTimes.length) {
+      while (!missed && pendingFrames.length && pendingTimes.length) {
         const frame = pendingFrames.shift();
         const time = pendingTimes.shift();
-        decoded++;
-        if (!reference) { reference = frame; continue; }
-        if (!(time > range.start && time < range.end) || time - lastReport < minGap - 1e-9) continue;
+        if (time <= range.start + TIME_TOLERANCE) { reference = frame; continue; }
+        if (!reference) {
+          if (retry) { missed = true; child.kill(); return; }
+          reference = frame;
+          continue;
+        }
+        if (!(time < range.end) || time - lastReport < minGap - 1e-9) continue;
         const value = score(frame);
         if (value > threshold) {
           const event = { time, score: Math.round(value * 1e6) / 1e6 };
@@ -734,6 +760,7 @@ function detectChanges(video, info, range, crop, settings, slow = !seekable(info
       }
     };
     child.stdout.on('data', (chunk) => {
+      if (missed) return;
       for (let offset = 0; offset < chunk.length;) {
         const count = Math.min(size - filled, chunk.length - offset);
         chunk.copy(partial, filled, offset, offset + count);
@@ -773,13 +800,15 @@ function detectChanges(video, info, range, crop, settings, slow = !seekable(info
     });
     child.on('error', (error) => reject(new Error(`ffmpeg: ${error.message}`)));
     child.on('close', (code) => {
+      if (missed) return resolve(detectChanges(video, info, range, crop, settings, attempt + 1));
       if (failed) return reject(failed);
       if (code !== 0) return reject(new Error(`ffmpeg exited ${code}: ${errors.join('\n')}`));
       drain();
+      if (missed) return resolve(detectChanges(video, info, range, crop, settings, attempt + 1));
       if (pendingFrames.length || pendingTimes.length || filled) {
         return reject(new Error(`ffmpeg frame/pts mismatch: ${pendingFrames.length} frames and ${pendingTimes.length} times unpaired, ${filled} trailing bytes`));
       }
-      if (!decoded && !slow) return resolve(detectChanges(video, info, range, crop, settings, true));
+      if (!reference && retry) return resolve(detectChanges(video, info, range, crop, settings, attempt + 1));
       // A valid sparse range may contain no new PTS. Baseline extraction still validates its displayed frame.
       resolve({ events, candidates, width, height });
     });
@@ -980,7 +1009,8 @@ async function execute({ command, video, videos, options }) {
     times = [];
     windows = [];
     for (const { around, start, end } of spans) {
-      const count = Math.ceil((end - start) * fps);
+      // Float noise in a centered window (1.4000000000000001 - 0.8) must not add a frame.
+      const count = Math.ceil((end - start) * fps - 1e-6);
       if (count < 1) throw new Error('inspect window contains no frames');
       if (times.length + count > 240) throw new Error('inspect would create over 240 frames; reduce --window, --fps or --around values');
       const first = times.length;
@@ -1021,23 +1051,13 @@ async function execute({ command, video, videos, options }) {
   const { directory, work } = output;
   const frames = [];
   const produced = [];
-  // Shared by every position that finds no frame, including concurrent ones.
-  let lastFrame;
   const extractFrame = async (time, i) => {
     const timecode = formatTimecode(time);
     const filename = `frame-${String(i).padStart(4, '0')}_${timecode.replaceAll(':', '-')}.jpg`;
     const target = path.join(work, filename);
     produced.push(target);
-    let extractionError;
-    try { await extract(video, info, time, width, target, crop); }
-    catch (error) { if (!error.emptyFrame) throw error; extractionError = error; }
-    if (extractionError && await nonempty(target)) throw extractionError;
-    if (!(await nonempty(target))) {
-      // No frame at or after `time`: if it is in the last frame's display interval (such as a sparse VFR tail), take that frame.
-      const last = await (lastFrame ??= lastFrameTime(info).catch(() => NaN));
-      if (Number.isFinite(last) && last >= info.start && last < time) await extract(video, info, last, width, target, crop);
-    }
-    if (!(await nonempty(target))) throw extractionError ?? new Error(`FFmpeg produced no frame for ${time}s`);
+    await extract(video, info, time, width, target, crop);
+    if (!(await nonempty(target))) throw new Error(`FFmpeg produced no frame for ${time}s`);
     return { file: filename, time, timecode };
   };
   try {

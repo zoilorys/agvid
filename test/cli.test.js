@@ -207,6 +207,15 @@ test('overlapping windows stay separate', async () => {
   });
 });
 
+test('a window that is a whole number of frame steps has no extra frame from float noise', async () => {
+  await withTempDirectory(async (directory) => {
+    // 1.4 - 0.8 is 0.6000000000000001 in floating point.
+    const output = success('inspect', video, '--around', '1.1', '--window', '0.6', '--fps', '10', '--width', '160', '--output', directory);
+    const manifest = JSON.parse(await readFile(output.manifest, 'utf8'));
+    assert.equal(manifest.frames.length, 6);
+  });
+});
+
 test('single inspect has one window; an out-of-range --around in a batch fails without output', async () => {
   await withTempDirectory(async (directory) => {
     const output = success('inspect', video, '--around', '5.0004', '--width', '160', '--output', path.join(directory, 'one'));
@@ -1215,36 +1224,6 @@ test('changes --max caps detected changes so the baseline keeps the run at 240 f
   });
 });
 
-test('tail positions share one last-frame lookup, and an unusable lookup keeps the extraction error', async () => {
-  await withTempDirectory(async (directory) => {
-    const source = path.join(directory, 'one-fps.mp4');
-    ffmpeg('-f', 'lavfi', '-i', 'testsrc2=size=160x90:rate=1:duration=3', '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', source);
-    const real = spawnSync('sh', ['-c', 'command -v ffprobe'], { encoding: 'utf8' }).stdout.trim();
-    const bin = path.join(directory, 'bin');
-    const calls = path.join(directory, 'calls');
-    await mkdir(bin);
-    // Logs tail lookups; with EMPTY set they list no packets, like a source without usable timestamps.
-    await writeFile(path.join(bin, 'ffprobe'), `#!/bin/sh
-case " $* " in *" -show_entries packet=pts,dts,duration,flags:stream=time_base "*) echo x >> "${calls}"; [ -n "$EMPTY" ] && exit 0;; esac
-exec "${real}" "$@"
-`);
-    await chmod(path.join(bin, 'ffprobe'), 0o755);
-    const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` };
-    // The default 12 frames put 2.125, 2.375, 2.625 and 2.875 s after the last frame at 2 s.
-    const overview = invokeIn({ env }, 'overview', source, '--output', path.join(directory, 'overview'));
-    assert.equal(overview.status, 0, overview.stderr);
-    assert.equal(JSON.parse(overview.stdout).frames, 12);
-    assert.equal(await readFile(calls, 'utf8'), 'x\n');
-
-    const failed = invokeIn({ env: { ...env, EMPTY: '1' } }, 'frame', source, '--at', '2.5', '--output', path.join(directory, 'failed'));
-    assert.notEqual(failed.status, 0);
-    // FFmpeg 8 fails to open the encoder when no frame decodes; earlier versions exit 0 without writing one.
-    assert.match(failed.stderr, /ffmpeg exited|FFmpeg produced no frame for 2\.5s/);
-    assert.doesNotMatch(failed.stderr, /Infinity|NaN/);
-    assert.deepEqual((await readdir(directory)).sort(), ['bin', 'calls', 'one-fps.mp4', 'overview']);
-  });
-});
-
 test('changes on a narrow full-height crop bounds analysis pixels and still finds the change', async () => {
   await withTempDirectory(async (directory) => {
     const source = path.join(directory, 'tall.mp4');
@@ -1280,7 +1259,7 @@ async function until(check, what) {
   throw new Error(`timed out waiting for ${what}`);
 }
 
-// An ffmpeg wrapper that records each frame extraction (-frames:v 1) as sync/call-N/<pid>. Calls after the first PASS
+// An ffmpeg wrapper that records each frame extraction (-update 1) as sync/call-N/<pid>. Calls after the first PASS
 // wait for sync/release and then run real FFmpeg, or fail with FAIL set (or after about 30 s, so a regression cannot
 // leave them waiting). Other calls run FFmpeg directly.
 async function gatedFfmpeg(directory) {
@@ -1289,7 +1268,7 @@ async function gatedFfmpeg(directory) {
   const sync = path.join(directory, 'sync');
   await mkdir(bin);
   await writeFile(path.join(bin, 'ffmpeg'), `#!/bin/sh
-case " $* " in *" -frames:v 1 "*) ;; *) exec "${real}" "$@";; esac
+case " $* " in *" -update 1 "*) ;; *) exec "${real}" "$@";; esac
 n=1; while ! mkdir "${sync}/call-$n" 2>/dev/null; do n=$((n+1)); done
 touch "${sync}/call-$n/$$"
 if [ "$n" -gt "\${PASS:-0}" ]; then
