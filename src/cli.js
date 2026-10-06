@@ -18,38 +18,97 @@ export { formatTimecode, parseTime } from './time.js';
 const HELP = `agvid <command> <video> [options]
 
 Work progressively: probe, overview, changes (screen recordings), then inspect or frame.
+Run agvid <command> --help for its options.
 
 Commands:
   probe <video>...               Source metadata as JSON; several videos print an array
-  overview <video>               Evenly spaced frames: --frames N (1-64, default 12)
+  overview <video>               Evenly spaced frames and labeled sheets (default 12 frames)
   changes <video>                Range start plus each frame where the picture changes
-  inspect <video> --around TIME [--window DURATION] [--fps N]
-  inspect <video> --start TIME --end TIME [--fps N]
-                                 Frames at --fps (default 4) in a centered window (total, default 2s) or range
+  inspect <video> --around TIME  Frames at a fixed rate around a moment, or over --start/--end
   frame <video> --at TIME        The frame on screen at each time
 
-Options:
-  --start TIME --end TIME   Limit overview, changes or inspect to a range
-  --crop X,Y,W,H            Region as fractions 0-1 of the displayed frame (left, top, width, height)
+Image commands write JPEG frames, timecode-labeled sheets and manifest.json (each frame's file and
+source time) to a fresh .agvid/runs/<video>-<command>/ under the git root (else cwd), and print
+their paths as JSON. Needs Node 20+ and FFmpeg/FFprobe 5.1+.
+Details: README.md and skill/agvid/references/advanced.md in the package.`;
+
+const IMAGE_OPTIONS = `  --crop X,Y,W,H            Region as fractions 0-1 of the displayed frame (left, top, width, height),
+                            cut at source resolution before scaling; at least 16x16 source pixels
   --width PX                Maximum frame width, 64-4096, default 640
   --output DIR              New or empty directory; default .agvid/runs/ under the git root (else cwd)
-  --video-stream N          Zero-based video stream (0:v:N), default 0; works with probe too
+  --video-stream N          Zero-based video stream (0:v:N), default 0`;
 
-changes tuning: --threshold X (changed-pixel share, default 0.002), --min-gap DURATION (0.5s),
---max N (48, up to 239), --analysis-fps N (30, 1-60), --analysis-width PX (256, 64-512),
---analysis-budget DURATION (300s: source video per decode attempt). Progress goes to stderr
-every 5s; past --max candidates it keeps the strongest per time slice and reports truncated: true.
+const TIMES = `TIME is seconds, MM:SS.s or HH:MM:SS.s; DURATION is seconds with an optional s. A time shows the
+last frame at or before it, and the manifest records the requested time. A run makes at most 240
+frames. A killed run leaves DIR/.agvid.lock; if no agvid run uses DIR, delete it and any
+.agvid.lock.work-* directories.`;
 
-TIME is seconds, MM:SS.s or HH:MM:SS.s; DURATION is seconds with an optional s. --at and --around take
-comma lists or repeat; a run makes at most 240 frames. A time shows the last frame at or before it,
-and the manifest records the requested time. Writes JPEG frames, timecode-labeled sheets and
-manifest.json, and prints their paths as JSON. A killed run leaves DIR/.agvid.lock; if no agvid run
-uses DIR, delete it and any .agvid.lock.work-* directories. Needs Node 20+ and FFmpeg/FFprobe 5.1+.
-Details: README.md and skill/agvid/references/advanced.md in the package.`;
+const COMMAND_HELP = {
+  probe: `agvid probe <video>... [--video-stream N]
+
+Prints the video stream's start, end, duration, displayed and coded size, sar, rotation, fps,
+frameCount, codec, pixelFormat, bitDepth and hasAudio as JSON. Several videos print an array in
+argument order; a failed file becomes { "video", "error" } and the exit code is 1.
+
+  --video-stream N          Zero-based video stream (0:v:N), default 0`,
+  overview: `agvid overview <video> [--frames N] [--start TIME] [--end TIME] [options]
+
+Evenly spaced frames across the video or range, plus timecode-labeled sheets. Open the sheets first.
+
+  --frames N                Frames to take, 1-64, default 12
+  --start TIME --end TIME   Limit to a range, clamped to the video
+${IMAGE_OPTIONS}
+
+${TIMES}`,
+  changes: `agvid changes <video> [--start TIME] [--end TIME] [--crop X,Y,W,H] [options]
+
+The range start plus each frame where more than --threshold of the pixels changed since the last
+change. Use --start/--end on long videos and --crop for small UI changes: a cursor-sized change stays
+under the default threshold. Progress goes to stderr every 5s; stdout holds the final JSON with
+changes, candidates and truncated. Manifest frames add a score.
+
+  --start TIME --end TIME   Limit to a range, clamped to the video
+  --threshold X             Changed-pixel share needed, above 0 to 1, default 0.002
+  --min-gap DURATION        Minimum spacing between changes, default 0.5s
+  --max N                   Changes kept, 1-239, default 48; past it the strongest per time slice
+                            are kept and truncated is true
+  --analysis-fps N          Sampling rate, 1-60, default 30; higher catches shorter changes
+  --analysis-width PX       Analysis width, 64-512, default 256; higher catches smaller changes
+  --analysis-budget DURATION
+                            Source seconds one decode attempt may cover, default 300s (not wall
+                            clock); an over-budget scan fails before decoding and says what to narrow
+${IMAGE_OPTIONS}
+
+${TIMES}`,
+  inspect: `agvid inspect <video> --around TIME [--window DURATION] [--fps N] [options]
+agvid inspect <video> --start TIME --end TIME [--fps N] [options]
+
+Frames at a fixed rate in a centered window or a range, plus timecode-labeled sheets.
+
+  --around TIME             Window center; comma list or repeat, each window gets its own sheets
+  --window DURATION         Total centered duration, clipped to the video, default 2s
+  --start TIME --end TIME   Inspect a range instead of --around/--window
+  --fps N                   Frames per second, 0.1-60, default 4
+${IMAGE_OPTIONS}
+
+${TIMES}`,
+  frame: `agvid frame <video> --at TIME [options]
+
+The frame on screen at each time. Several times also write a sheet.
+
+  --at TIME                 Moment to extract; comma list or repeat, deduped and sorted
+${IMAGE_OPTIONS}
+
+${TIMES}`,
+};
 
 export async function main(args) {
   if (args.length === 0 || ['--help', '-h', 'help'].includes(args[0])) {
-    console.log(HELP);
+    console.log(COMMAND_HELP[args[1]] ?? HELP);
+    return;
+  }
+  if (COMMAND_HELP[args[0]] && args.slice(1).some((arg) => arg === '--help' || arg === '-h')) {
+    console.log(COMMAND_HELP[args[0]]);
     return;
   }
   if (args[0] === '--version' || args[0] === '-v') {
@@ -57,7 +116,7 @@ export async function main(args) {
     console.log(pkg.version);
     return;
   }
-  const parsed = parseArgs(args, HELP);
+  const parsed = parseArgs(args, COMMAND_HELP[args[0]] ?? HELP);
   process.on('SIGINT', cancel);
   process.on('SIGTERM', cancel);
   try { await execute(parsed); }

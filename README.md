@@ -78,36 +78,25 @@ Each image command prints where it wrote its files:
 
 ## Commands
 
-| Command | What it does | Key options |
-| --- | --- | --- |
-| `probe <video>...` | Prints source metadata as JSON | `--video-stream` |
-| `overview <video>` | Evenly spaced frames | `--frames` (1–64, default 12), `--start`, `--end` |
-| `changes <video>` | Range start plus each frame where the picture changes | `--threshold`, `--max`, `--start`, `--end` |
-| `inspect <video>` | Frames at a fixed rate around a moment or over a range | `--around`, `--window` (default 2s), `--fps` (default 4), `--start`, `--end` |
-| `frame <video>` | Frames at exact moments | `--at` |
+| Command | What it does |
+| --- | --- |
+| `probe <video>...` | Source metadata as JSON |
+| `overview <video>` | Evenly spaced frames (default 12) |
+| `changes <video>` | Range start plus each frame where the picture changes |
+| `inspect <video>` | Frames at a fixed rate around `--around` (or over `--start/--end`) |
+| `frame <video>` | The frame on screen at each `--at` time |
 
-Image commands accept `--crop`, `--width`, `--output` and `--video-stream`. Times accept seconds, `MM:SS.s` or `HH:MM:SS.s`; durations accept seconds with an optional `s`. A time shows the frame on screen then: the last frame at or before it. `--at` and `--around` take comma lists or repeated flags; each `--around` gets its own window and sheets. A run makes at most 240 frames.
+Run `agvid <command> --help` for every option, default and limit. Times accept seconds, `MM:SS.s` or `HH:MM:SS.s`, and a time shows the frame on screen then. `--at` and `--around` take comma lists. The [advanced reference](skill/agvid/references/advanced.md) covers detection tuning, multiple video streams, unusual formats and exact timeline rules.
 
-The [advanced reference](skill/agvid/references/advanced.md) covers exact detection settings, `--video-stream`, multi-file `probe`, unusual formats and timeline rules.
+### Typical flows
 
-### Crop
-
-`--crop x,y,w,h` takes fractions 0–1 of the displayed frame (left, top, width, height). Estimate them from a sheet tile: a button about 80% across and 40% down, roughly 15% wide and 20% tall, is `--crop 0.8,0.4,0.15,0.2`. The region is cut at source resolution before `--width` scaling, never enlarged, and must be at least 16×16 source pixels.
-
-### Change detection
-
-`changes` decodes the range once, samples up to 30 fps, and keeps the range start plus each frame where more than `--threshold` (default `0.002`) of the pixels changed in any RGB channel since the last detected change, at least `--min-gap` (default `0.5s`) apart.
-
-- **Small changes:** a cursor-sized box stays below the default threshold. `--crop` to the region or lower `--threshold`.
-- **Long videos:** `--analysis-budget` (default `300`) caps the source seconds one decode attempt may cover, so an oversized scan fails before decoding and says how to narrow `--start/--end`. It is not wall-clock time.
-- **Progress:** scans longer than 5 s report progress on stderr; stdout stays JSON.
-- **Truncation:** past `--max` (default 48) candidates, the strongest change of each time slice is kept so quiet stretches stay covered. Output reports `candidates` and `truncated`.
-
-`--analysis-fps` and `--analysis-width` trade decode time for sensitivity.
+- **Screen recording:** `overview`, then `changes` (narrow long videos with `--start/--end`; add `--crop` for small UI changes), then `frame --at` the interesting moments.
+- **Motion or animation:** `overview`, then `inspect --around TIME --window 2s --fps 8`.
+- **Small text or UI:** add `--crop x,y,w,h` (fractions 0–1 of the frame: left, top, width, height) to any image command. A button 80% across, 40% down, about 15% wide and 20% tall is `--crop 0.8,0.4,0.15,0.2`. The region is cut at source resolution, so text stays legible.
 
 ## Output
 
-Each run writes to a fresh directory, `.agvid/runs/<video>-<command>[-N]/`, under the git root (else the current directory). `.agvid/` ignores itself in git. `--output DIR` picks another directory, which must be new or empty.
+Each run writes to a fresh `.agvid/runs/<video>-<command>/` under the git root (else the current directory), or to `--output DIR`. `.agvid/` ignores itself in git.
 
 ```
 .agvid/runs/demo-overview/
@@ -117,9 +106,7 @@ Each run writes to a fresh directory, `.agvid/runs/<video>-<command>[-N]/`, unde
 └── manifest.json
 ```
 
-- **Frames:** JPEGs named `frame-<index>_<timecode>.jpg`, at most `--width` pixels wide (default 640, range 64–4096, never above the displayed width), aspect ratio preserved.
-- **Sheets:** `overview`, `inspect`, `changes`, and `frame` with several `--at` times write `sheet-01.jpg`, … with tiles labeled by timecode, at most 1568 px per side.
-- **Manifest:** `manifest.json` records the `command`, the `source` metadata, and every frame's `file`, requested `time` (seconds) and `timecode`. Depending on the command it also holds `sheets`, `crop`, `range`, `windows` and `detection`; `changes` frames add a `score`.
+Frames are JPEGs at most `--width` (default 640) pixels wide. Sheets tile them with timecode labels. `manifest.json` records the source metadata and each frame's `file`, requested `time` (seconds) and `timecode`:
 
 ```json
 {
@@ -130,8 +117,6 @@ Each run writes to a fresh directory, `.agvid/runs/<video>-<command>[-N]/`, unde
   ]
 }
 ```
-
-A run holds `DIR/.agvid.lock`, so a concurrent run on the same directory fails. Errors, Ctrl-C and SIGTERM remove the run's files. A run killed outright leaves its lock and `.agvid.lock.work-*` staging directory; agvid never removes them, so delete them by hand once no agvid run uses the directory.
 
 ## Limitations
 

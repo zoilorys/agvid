@@ -3,7 +3,7 @@ import { displayedSize, parseCrop } from './geometry.js';
 import { SOURCE_FORMAT, attempts } from './seek.js';
 import { formatTimecode, parseTime } from './time.js';
 
-const OPTIONS = {
+export const OPTIONS = {
   overview: new Set(['frames', 'start', 'end', 'crop', 'width', 'output', 'video-stream']),
   inspect: new Set(['around', 'window', 'fps', 'start', 'end', 'crop', 'width', 'output', 'video-stream']),
   frame: new Set(['at', 'crop', 'width', 'output', 'video-stream']),
@@ -57,7 +57,7 @@ export function parseArgs(args, help) {
       const equals = arg.indexOf('=');
       const key = equals < 0 ? arg.slice(2) : arg.slice(2, equals);
       const name = `--${key}`;
-      if (!OPTIONS[command].has(key)) throw new Error(`unknown option: ${name}`);
+      if (!OPTIONS[command].has(key)) throw new Error(`unknown option: ${name}; see agvid ${command} --help`);
       if (!MULTI.has(key) && options[key] !== undefined) throw new Error(`duplicate option: ${name}`);
       const value = equals < 0 ? rest[++i] : arg.slice(equals + 1);
       if (!value || (equals < 0 && value.startsWith('--'))) throw new Error(`missing value for ${name}`);
