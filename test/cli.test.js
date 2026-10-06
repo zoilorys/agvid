@@ -5,6 +5,7 @@ import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, utimes, w
 import os from 'node:os';
 import path from 'node:path';
 import { formatTimecode } from '../src/cli.js';
+import { OPTIONS } from '../src/plan.js';
 
 const video = path.resolve('test/fixtures/test.mov');
 const cli = path.resolve('bin/agvid.js');
@@ -49,6 +50,14 @@ function jpegInfo(file) {
   assert.ok(stream.width > 0 && stream.height > 0);
   return stream;
 }
+
+test('each command help documents every option the command accepts', () => {
+  for (const [command, options] of Object.entries(OPTIONS)) {
+    const result = invoke(command, '--help');
+    assert.equal(result.status, 0, result.stderr);
+    for (const option of options) assert.match(result.stdout, new RegExp(`--${option}\\b`), `${command} --help lacks --${option}`);
+  }
+});
 
 test('probe reports the real fixture and frame extracts a bounded JPEG at its requested time', async () => {
   await withTempDirectory(async (directory) => {
