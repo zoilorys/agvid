@@ -1,0 +1,21 @@
+== bundled test/fixtures/test.mov (1280x800 60/1 25.583333s h264)
+probe        median 0.231s  min 0.206s
+overview12   median 1.096s  min 1.095s  frames 12
+overview48   median 3.290s  min 3.241s  frames 48
+frame1       median 0.378s  min 0.370s  frames 1
+frame5       median 0.628s  min 0.624s  frames 5
+inspect8     median 0.889s  min 0.882s  frames 8
+inspect100   median 6.401s  min 6.319s  frames 100
+changes      median 5.500s  min 5.463s  frames 36
+changesCrop  median 3.825s  min 3.788s  frames 32
+generating /Users/illiapuzanov/personal/oss/agvid/benchmark/.cache/testsrc2-1080p60-20s.mp4
+== short benchmark/.cache/testsrc2-1080p60-20s.mp4 (1920x1080 60/1 20s h264)
+probe        median 0.238s  min 0.220s
+overview12   median 3.087s  min 2.713s  frames 12
+overview48   median 10.726s  min 10.721s  frames 48
+frame1       median 0.764s  min 0.741s  frames 1
+frame5       median 1.540s  min 1.447s  frames 5
+inspect8     median 2.136s  min 2.114s  frames 8
+inspect100   median 21.034s  min 21.015s  frames 100
+changes      median 13.053s  min 12.593s  frames 40
+changesCrop  median 8.637s  min 8.441s  frames 30
