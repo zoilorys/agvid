@@ -1,6 +1,6 @@
 {
   "name": "agvid",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Video frames and metadata for coding agents",
   "license": "MIT",
   "author": "Illia Puzanov",
